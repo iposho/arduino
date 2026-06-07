@@ -1,0 +1,26 @@
+# Arduino build output
+build/
+*.elf
+*.bin
+*.hex
+
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Secrets (WiFi, API keys, tokens)
+*/secrets.h
+
+# Libraries (install via Library Manager)
+libraries/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
