@@ -49,8 +49,9 @@
 #define LCD_PAGE_SYSTEM    0   // WiFi + BME + PMS статус
 #define LCD_PAGE_AQI       1   // PM2.5 + цвет LED
 #define LCD_PAGE_TIMER     2   // Таймеры + буфер
-#define LCD_PAGE_COUNT     3
-#define LCD_PAGE_MS       3000UL // 3 сек на страницу
+#define LCD_PAGE_REBOOT    3   // Причина последнего ребута
+#define LCD_PAGE_COUNT     4
+#define LCD_PAGE_MS       5000UL // 5 сек на страницу
 
 // =====================
 // Тайминги
@@ -132,6 +133,52 @@ struct PmsAccumulator {
 };
 
 // =====================
+// Кольцевой лог (хранится в RAM)
+// =====================
+#define LOG_ENTRY_LEN    64
+#define EVENT_LOG_SIZE   15
+#define ERROR_LOG_SIZE   10
+
+struct RingLog {
+  char     entries[20][LOG_ENTRY_LEN];
+  unsigned long timestamps[20];
+  int      maxSize;
+  int      head;
+  int      count;
+
+  void init(int size) {
+    maxSize = size;
+    head = 0;
+    count = 0;
+  }
+
+  void add(const char* text) {
+    strncpy(entries[head], text, LOG_ENTRY_LEN - 1);
+    entries[head][LOG_ENTRY_LEN - 1] = '\0';
+    timestamps[head] = millis() / 1000UL;
+    head = (head + 1) % maxSize;
+    if (count < maxSize) count++;
+  }
+
+  String format() {
+    if (count == 0) return "  _пусто_\n";
+    String result = "";
+    int start = (head - count + maxSize) % maxSize;
+    for (int i = 0; i < count; i++) {
+      int idx = (start + i) % maxSize;
+      unsigned long sec = timestamps[idx];
+      char timeBuf[12];
+      snprintf(timeBuf, sizeof(timeBuf), "%luh%02lum", sec / 3600, (sec % 3600) / 60);
+      result += "  `" + String(timeBuf) + "` " + String(entries[idx]) + "\n";
+    }
+    return result;
+  }
+};
+
+RingLog eventLog;
+RingLog errorLog;
+
+// =====================
 // Объекты и состояние
 // =====================
 Adafruit_BME280 bme;
@@ -145,7 +192,6 @@ int  pmsErrorCount = 0;
 
 unsigned long lastClimateSendTime  = 0;
 unsigned long lastClimateTickTime  = 0;
-unsigned long lastPmsReadTime      = 0;
 unsigned long pmsWakeupTargetTime  = 0;
 unsigned long pmsSamplingStartTime = 0;
 unsigned long pmsLastSampleTime    = 0;
@@ -165,6 +211,29 @@ float humBuffer [CLIMATE_BUFFER_SIZE];
 float presBuffer[CLIMATE_BUFFER_SIZE];
 int   climateBufferIndex = 0;
 
+// Детекция залипших датчиков
+float lastBmeTemp = -999.0f;
+int   staleBmeCount = 0;
+const int STALE_BME_THRESHOLD = 10;   // 10 x 30 сек = 5 мин одинаковых показаний
+
+float lastPmsMedian = -1.0f;
+int   stalePmsCount = 0;
+const int STALE_PMS_THRESHOLD = 6;    // 6 x 30 мин = 3 часа одинаковых медиан
+
+// Причина последнего ребута (для LCD)
+char rebootReasonShort[17] = "";  // 16 символов LCD + '\0'
+
+// Ошибки Supabase
+int  supabaseErrorCount = 0;
+int  supabaseTotalErrors = 0;
+const int SUPABASE_MAX_ERRORS = 3;
+
+// Telegram-команды (удалённый ребут/статус)
+unsigned long lastTelegramCheckTime = 0;
+const unsigned long TELEGRAM_CHECK_INTERVAL = 60UL * 1000UL;
+long telegramUpdateId = 0;
+bool telegramOffsetInit = false;
+
 // Forward declarations
 void    connectToWiFi();
 void    sendDataToSupabase(float t, float h, float p);
@@ -176,6 +245,7 @@ String  pmsStatsJson(const char* prefix, PmsStats &s);
 void    setLedColor(bool r, bool g, bool y);
 void    updateTrafficLight();
 void    updateLcd(uint8_t page);
+void    checkTelegramCommands();
 
 // ============================================================
 // SETUP
@@ -184,6 +254,9 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n--- Уличная метеостанция (Климат 5м / Пыль 30м) ---");
+
+  eventLog.init(EVENT_LOG_SIZE);
+  errorLog.init(ERROR_LOG_SIZE);
 
   // Инициализация пинов светодиода
   pinMode(LED_R, OUTPUT);
@@ -212,9 +285,23 @@ void setup() {
   memset(&lastStatsPm25, 0, sizeof(PmsStats));
   memset(&lastStatsPm10, 0, sizeof(PmsStats));
 
+  // --- Причина ребута (сохраняем для LCD) ---
+  esp_reset_reason_t rstReason = esp_reset_reason();
+  switch (rstReason) {
+    case ESP_RST_POWERON:  strncpy(rebootReasonShort, "POWER ON",    16); break;
+    case ESP_RST_SW:       strncpy(rebootReasonShort, "SOFTWARE RST", 16); break;
+    case ESP_RST_WDT:      strncpy(rebootReasonShort, "WATCHDOG!",   16); break;
+    case ESP_RST_PANIC:    strncpy(rebootReasonShort, "PANIC!",      16); break;
+    case ESP_RST_BROWNOUT: strncpy(rebootReasonShort, "BROWNOUT!",   16); break;
+    case ESP_RST_DEEPSLEEP:strncpy(rebootReasonShort, "DEEP SLEEP",  16); break;
+    default:               strncpy(rebootReasonShort, "UNKNOWN",     16); break;
+  }
+
   // --- BME280 ---
   bmeReady = bme.begin(BME280_ADDR, &Wire);
   Serial.println(bmeReady ? "[ОК] BME280 инициализирован." : "[Ошибка] BME280 не найден!");
+  eventLog.add(bmeReady ? "BME280 OK" : "BME280 FAIL");
+  if (!bmeReady) errorLog.add("BME280 не найден при старте");
 
   // --- PMS5003 ---
   Serial2.begin(9600, SERIAL_8N1, PMS_RX, PMS_TX);
@@ -234,6 +321,7 @@ void setup() {
 
   // --- Честный стартовый прогрев PMS (30 сек) + серия замеров ---
   if (WiFi.status() == WL_CONNECTED) {
+    eventLog.add("WiFi OK");
     lastWifiConnectedTime = millis();
     Serial.println("[Система] Старт полноценного прогрева PMS5003 для честного стартового замера...");
     pms.wakeUp();
@@ -266,49 +354,55 @@ void setup() {
       pmsErrorCount = 0;
       Serial.printf("[PMS5003] Стартовая серия: n=%d, PM2.5 med=%.0f σ=%.1f\n",
                     lastStatsPm25.count, lastStatsPm25.median, lastStatsPm25.stddev);
+      char buf[LOG_ENTRY_LEN];
+      snprintf(buf, sizeof(buf), "PMS старт: n=%d PM2.5=%.0f", lastStatsPm25.count, lastStatsPm25.median);
+      eventLog.add(buf);
       updateTrafficLight();
     } else {
       pmsErrorCount++;
       Serial.println("[Предупреждение] PMS5003: 0 чтений при старте.");
+      errorLog.add("PMS5003: 0 чтений при старте");
       setLedColor(true, false, false);
     }
     pms.sleep();
 
-    // Определение причины перезагрузки для Telegram
-    esp_reset_reason_t reason = esp_reset_reason();
-    String rebootReasonStr = "POWERON_RESET / Запуск";
-    if (reason == ESP_RST_WDT) rebootReasonStr = "🚨 WATCHDOG_RESET (Зависание системы)";
-    else if (reason == ESP_RST_SW) rebootReasonStr = "🔄 SOFTWARE_RESET (Отказ сети)";
+    // Причина перезагрузки для Telegram (детальнее чем LCD)
+    String rebootReasonStr = String(rebootReasonShort);
+    if (rstReason == ESP_RST_WDT)   rebootReasonStr = "🚨 WATCHDOG (Зависание)";
+    else if (rstReason == ESP_RST_SW)      rebootReasonStr = "🔄 SOFTWARE (Программный)";
+    else if (rstReason == ESP_RST_PANIC)   rebootReasonStr = "💥 PANIC (Критическая)";
+    else if (rstReason == ESP_RST_BROWNOUT) rebootReasonStr = "⚡ BROWNOUT (Питание)";
 
     // Telegram Рапорт
     float sT = 0, sH = 0, sP = 0;
     bool cOk = readClimate(sT, sH, sP);
 
-    String msg = "🤖 *СТАТУС: МЕТЕОСТАНЦИЯ БАЛКОН*\n";
-    msg += "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n";
-    msg += "⚡ *Система:* `" + rebootReasonStr + "`\n";
-    msg += "⏱ *Uptime:* `" + String(millis()) + " ms`\n";
-    msg += "🌐 *IP:* `" + WiFi.localIP().toString() + "`\n";
-    msg += "📶 *RSSI:* `" + String(WiFi.RSSI()) + " dBm`\n\n";
-    msg += "📡 *Железо:*\n";
-    msg += (bmeReady ? "✅ BME280: `OK`" : "❌ BME280: `ERROR`") + String("\n");
-    msg += "✅ PMS5003: `SLEEP` (Цикл: 30м)\n\n";
-    msg += "📝 *Первичные замеры (Честные):*\n";
+    String msg = "🤖 *МЕТЕОСТАНЦИЯ БАЛКОН — ЗАПУСК*\n";
+    msg += "━━━━━━━━━━━━━━━━━━━━━\n\n";
+    msg += "⚡ *Причина:* `" + rebootReasonStr + "`\n";
+    msg += "⏱ Uptime: `" + String(millis()) + " ms`\n";
+    msg += "🌐 IP: `" + WiFi.localIP().toString() + "`\n";
+    msg += "📶 RSSI: `" + String(WiFi.RSSI()) + " dBm`\n\n";
+
+    msg += "📡 *Железо*\n";
+    msg += (bmeReady ? "  ✅ BME280 — `OK`\n" : "  ❌ BME280 — `ОШИБКА`\n");
+    msg += "  ✅ PMS5003 — `SLEEP` (цикл 30м)\n\n";
+
+    msg += "📝 *Стартовые замеры*\n";
     if (cOk) {
-      msg += "🌡 Температура: *" + String(sT, 1) + " °C*\n";
-      msg += "💧 Влажность: *" + String(sH, 0) + " %*\n";
-      msg += "📉 Давление: *" + String(sP, 1) + " mmHg*\n";
+      msg += "  🌡 `" + String(sT, 1) + " °C`\n";
+      msg += "  💧 `" + String(sH, 0) + " %`\n";
+      msg += "  📉 `" + String(sP, 1) + " mmHg`\n";
     } else {
-      msg += "⚠️ BME280: нет данных\n";
+      msg += "  ⚠️ BME280: нет данных\n";
     }
     if (hasPmsStats) {
-      msg += "💨 PM2.5: *" + String((int)lastStatsPm25.median) + " мкг/м³*";
-      msg += " (n=" + String(lastStatsPm25.count);
-      msg += " min=" + String((int)lastStatsPm25.min);
-      msg += " max=" + String((int)lastStatsPm25.max);
-      msg += " σ=" + String(lastStatsPm25.stddev, 1) + ")\n";
+      msg += "  💨 PM2.5: `" + String((int)lastStatsPm25.median) + " мкг/м³`";
+      msg += "  (n=" + String(lastStatsPm25.count);
+      msg += ", σ=" + String(lastStatsPm25.stddev, 1);
+      msg += ", " + String((int)lastStatsPm25.min) + "–" + String((int)lastStatsPm25.max) + ")\n";
     }
-    msg += "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬";
+    msg += "\n━━━━━━━━━━━━━━━━━━━━━";
     sendTelegramMessage(msg);
   }
 
@@ -316,7 +410,6 @@ void setup() {
   unsigned long now         = millis();
   lastClimateTickTime       = now - CLIMATE_TICK_INTERVAL;
   lastClimateSendTime       = now;
-  lastPmsReadTime           = now;
   pmsWakeupTargetTime       = now + PMS_READ_INTERVAL - PMS_WAKEUP_TIME - PMS_SAMPLE_TIME;
 
   Serial.println("[Система] Вход в рабочий цикл.");
@@ -337,6 +430,7 @@ void loop() {
     // Если Wi-Fi лежит слишком долго — принудительный ребут
     if (now - lastWifiConnectedTime > WIFI_TIMEOUT_REBOOT) {
       Serial.println("[Критическая ошибка] Сеть недоступна более 10 минут. Ребут!");
+      errorLog.add("WiFi таймаут 10м -> ребут");
       delay(500);
       esp_restart();
     }
@@ -347,6 +441,13 @@ void loop() {
   // Профилактический суточный ребут (защита от утечек памяти)
   if (now > 24UL * 60UL * 60UL * 1000UL) {
     Serial.println("[Профилактика] Суточный перезапуск системы...");
+    String msg = "🔄 *БАЛКОН — Суточный ребут*\n";
+    msg += "━━━━━━━━━━━━━━━━━━━━━\n\n";
+    msg += "🧠 Heap: `" + String(ESP.getFreeHeap()) + " bytes`\n";
+    msg += "📶 RSSI: `" + String(WiFi.RSSI()) + " dBm`\n";
+    msg += "🗄 Ошибок Supabase: `" + String(supabaseTotalErrors) + "`\n\n";
+    msg += "━━━━━━━━━━━━━━━━━━━━━";
+    sendTelegramMessage(msg);
     delay(1000);
     esp_restart();
   }
@@ -363,6 +464,29 @@ void loop() {
         Serial.printf("[Буфер климата] %d/%d -> T:%.1f P:%.1f\n",
                       climateBufferIndex + 1, CLIMATE_BUFFER_SIZE, t, p);
         climateBufferIndex++;
+
+        // Детекция залипшего BME280
+        if (t == lastBmeTemp) {
+          staleBmeCount++;
+          if (staleBmeCount >= STALE_BME_THRESHOLD) {
+            Serial.printf("[STALE] BME280 завис: %.2f°C x%d раз\n", t, staleBmeCount);
+            char buf[LOG_ENTRY_LEN];
+            snprintf(buf, sizeof(buf), "BME280 STALE %.2f°C x%d -> ребут", t, staleBmeCount);
+            errorLog.add(buf);
+            String msg = "🚨 *БАЛКОН — BME280 ЗАВИС*\n";
+            msg += "━━━━━━━━━━━━━━━━━━━━━\n\n";
+            msg += "🌡 Температура: `" + String(t, 2) + " °C`\n";
+            msg += "🔁 Повторов подряд: `" + String(staleBmeCount) + "`\n\n";
+            msg += "⚡ Перезагрузка...\n\n";
+            msg += "━━━━━━━━━━━━━━━━━━━━━";
+            sendTelegramMessage(msg);
+            delay(1000);
+            esp_restart();
+          }
+        } else {
+          staleBmeCount = 0;
+          lastBmeTemp = t;
+        }
       }
     }
   }
@@ -408,18 +532,53 @@ void loop() {
         hasPmsStats   = true;
         pmsErrorCount = 0;
 
+        // Детекция залипшего PMS5003
+        if (lastStatsPm25.median == lastPmsMedian && lastPmsMedian >= 0) {
+          stalePmsCount++;
+          if (stalePmsCount >= STALE_PMS_THRESHOLD) {
+            Serial.printf("[STALE] PMS5003 завис: PM2.5=%.0f x%d циклов\n",
+                          lastPmsMedian, stalePmsCount);
+            char buf[LOG_ENTRY_LEN];
+            snprintf(buf, sizeof(buf), "PMS STALE PM2.5=%.0f x%d -> ребут", lastPmsMedian, stalePmsCount);
+            errorLog.add(buf);
+            String msg = "🚨 *БАЛКОН — PMS5003 ЗАВИС*\n";
+            msg += "━━━━━━━━━━━━━━━━━━━━━\n\n";
+            msg += "💨 PM2.5: `" + String((int)lastPmsMedian) + " мкг/м³`\n";
+            msg += "🔁 Циклов подряд: `" + String(stalePmsCount) + "`\n\n";
+            msg += "⚡ Перезагрузка...\n\n";
+            msg += "━━━━━━━━━━━━━━━━━━━━━";
+            sendTelegramMessage(msg);
+            delay(1000);
+            esp_restart();
+          }
+        } else {
+          stalePmsCount = 0;
+        }
+        lastPmsMedian = lastStatsPm25.median;
+
         Serial.printf("[PMS5003] PM2.5: med=%.0f avg=%.1f σ=%.1f min=%.0f max=%.0f n=%d\n",
                       lastStatsPm25.median, lastStatsPm25.mean, lastStatsPm25.stddev,
                       lastStatsPm25.min, lastStatsPm25.max, lastStatsPm25.count);
+        {
+          char buf[LOG_ENTRY_LEN];
+          snprintf(buf, sizeof(buf), "PMS OK n=%d PM2.5=%.0f", lastStatsPm25.count, lastStatsPm25.median);
+          eventLog.add(buf);
+        }
 
         updateTrafficLight();
       } else {
         pmsErrorCount++;
         Serial.printf("[PMS5003] 0 чтений! Ошибок подряд: %d\n", pmsErrorCount);
+        char buf[LOG_ENTRY_LEN];
+        snprintf(buf, sizeof(buf), "PMS 0 чтений (подряд: %d)", pmsErrorCount);
+        errorLog.add(buf);
         setLedColor(true, false, false);
         if (pmsErrorCount >= PMS_MAX_ERRORS) {
-          String alert = "⚠️ *PMS5003 НЕ ОТВЕЧАЕТ*\nОшибок подряд: *";
-          alert += String(pmsErrorCount) + "*\nПроверьте питание и UART.";
+          String alert = "🚨 *БАЛКОН — PMS5003 НЕ ОТВЕЧАЕТ*\n";
+          alert += "━━━━━━━━━━━━━━━━━━━━━\n\n";
+          alert += "🔁 Ошибок подряд: `" + String(pmsErrorCount) + "`\n";
+          alert += "🔧 Проверьте питание и UART\n\n";
+          alert += "━━━━━━━━━━━━━━━━━━━━━";
           sendTelegramMessage(alert);
           pmsErrorCount = 0;
         }
@@ -428,7 +587,6 @@ void loop() {
       pms.sleep();
       pmsIsAwake  = false;
       pmsSampling = false;
-      lastPmsReadTime     = now;
       pmsWakeupTargetTime = now + PMS_READ_INTERVAL - PMS_WAKEUP_TIME - PMS_SAMPLE_TIME;
     }
   }
@@ -465,6 +623,12 @@ void loop() {
 
     sendDataToSupabase(fT, fH, fP);
     lastClimateSendTime = millis();
+  }
+
+  // ── 7. Telegram-команды (удалённый ребут/статус) ──
+  if (now - lastTelegramCheckTime >= TELEGRAM_CHECK_INTERVAL) {
+    lastTelegramCheckTime = now;
+    checkTelegramCommands();
   }
 
   delay(200);
@@ -576,8 +740,44 @@ void sendDataToSupabase(float t, float h, float p) {
                 hasPmsStats ? lastStatsPm25.median : 0.0f,
                 hasPmsStats ? lastStatsPm25.count  : 0);
   int code = http.POST(json);
-  Serial.printf("[Supabase] HTTP %d\n", code);
   http.end();
+
+  if (code >= 200 && code < 300) {
+    Serial.printf("[Supabase] OK %d\n", code);
+    if (supabaseErrorCount > 0) {
+      Serial.printf("[Supabase] Восстановлено после %d ошибок подряд\n", supabaseErrorCount);
+      char buf[LOG_ENTRY_LEN];
+      snprintf(buf, sizeof(buf), "Supabase восст. после %d ошибок", supabaseErrorCount);
+      eventLog.add(buf);
+    }
+    supabaseErrorCount = 0;
+    eventLog.add("Supabase OK");
+  } else {
+    supabaseErrorCount++;
+    supabaseTotalErrors++;
+    Serial.printf("[Supabase] ОШИБКА %d (подряд: %d, всего: %d)\n",
+                  code, supabaseErrorCount, supabaseTotalErrors);
+    Serial.printf("[Supabase] Потерянные данные: T:%.2f H:%.2f P:%.2f PM2.5:%.0f\n",
+                  t, h, p, hasPmsStats ? lastStatsPm25.median : 0.0f);
+    char buf[LOG_ENTRY_LEN];
+    snprintf(buf, sizeof(buf), "Supabase FAIL HTTP %d T:%.1f", code, t);
+    errorLog.add(buf);
+
+    if (supabaseErrorCount >= SUPABASE_MAX_ERRORS) {
+      String alert = "🚨 *БАЛКОН — SUPABASE НЕ ОТВЕЧАЕТ*\n";
+      alert += "━━━━━━━━━━━━━━━━━━━━━\n\n";
+      alert += "🔁 Ошибок подряд: `" + String(supabaseErrorCount) + "`\n";
+      alert += "🗄 Всего за сессию: `" + String(supabaseTotalErrors) + "`\n";
+      alert += "📡 HTTP код: `" + String(code) + "`\n\n";
+      alert += "📝 *Потерянные данные:*\n";
+      alert += "  🌡 `" + String(t, 1) + " °C`\n";
+      alert += "  💧 `" + String(h, 0) + " %`\n";
+      alert += "  📉 `" + String(p, 1) + " mmHg`\n\n";
+      alert += "━━━━━━━━━━━━━━━━━━━━━";
+      sendTelegramMessage(alert);
+      supabaseErrorCount = 0;
+    }
+  }
 }
 
 // ============================================================
@@ -595,10 +795,13 @@ void connectToWiFi() {
     Serial.print(".");
     att++;
   }
-  if (WiFi.status() == WL_CONNECTED)
+  if (WiFi.status() == WL_CONNECTED) {
     Serial.printf(" OK! %s\n", WiFi.localIP().toString().c_str());
-  else
+    eventLog.add("WiFi reconnect OK");
+  } else {
     Serial.println(" FAIL");
+    errorLog.add("WiFi reconnect FAIL");
+  }
 }
 
 // ============================================================
@@ -625,6 +828,122 @@ void sendTelegramMessage(String message) {
   if (code > 0) Serial.printf("[Telegram] %d\n", code);
   else          Serial.printf("[Telegram] ERR: %s\n", http.errorToString(code).c_str());
   http.end();
+}
+
+// ============================================================
+// Telegram — приём команд (/reboot, /status)
+// ============================================================
+void checkTelegramCommands() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  esp_task_wdt_reset();
+  HTTPClient http;
+
+  // Первый вызов после загрузки: пропускаем старые сообщения,
+  // чтобы старая команда /reboot не вызвала цикл перезагрузок
+  if (!telegramOffsetInit) {
+    String url = "https://api.telegram.org/bot" + String(TELEGRAM_TOKEN)
+               + "/getUpdates?offset=-1&limit=1";
+    http.begin(url);
+    int code = http.GET();
+    if (code == 200) {
+      String payload = http.getString();
+      int idx = payload.indexOf("\"update_id\":");
+      if (idx >= 0) {
+        telegramUpdateId = payload.substring(idx + 12).toInt() + 1;
+      }
+    }
+    http.end();
+    telegramOffsetInit = true;
+    Serial.printf("[Telegram] Offset инициализирован: %ld\n", telegramUpdateId);
+    return;
+  }
+
+  String url = "https://api.telegram.org/bot" + String(TELEGRAM_TOKEN)
+             + "/getUpdates?offset=" + String(telegramUpdateId)
+             + "&limit=5&timeout=1";
+  http.begin(url);
+  int code = http.GET();
+
+  if (code != 200) {
+    http.end();
+    return;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  // Сдвигаем offset на последний update_id + 1
+  int lastIdx = payload.lastIndexOf("\"update_id\":");
+  if (lastIdx >= 0) {
+    long lastId = payload.substring(lastIdx + 12).toInt();
+    telegramUpdateId = lastId + 1;
+  }
+
+  // Проверяем, что сообщение от нашего чата
+  if (payload.indexOf(String(TELEGRAM_CHAT_ID)) < 0) return;
+
+  if (payload.indexOf("/balcony_esp_rst") >= 0) {
+    Serial.println("[Telegram] Получена команда /balcony_esp_rst");
+    String msg = "🔄 *БАЛКОН — Удалённый ребут*\n";
+    msg += "━━━━━━━━━━━━━━━━━━━━━\n\n";
+    msg += "📩 Команда: `/balcony\\_esp\\_rst`\n";
+    msg += "⚡ Перезагрузка...\n\n";
+    msg += "━━━━━━━━━━━━━━━━━━━━━";
+    sendTelegramMessage(msg);
+    delay(1000);
+    esp_restart();
+  }
+
+  if (payload.indexOf("/balcony_status") >= 0) {
+    Serial.println("[Telegram] Получена команда /balcony_status");
+    unsigned long upMin = millis() / 60000UL;
+    String msg = "📊 *БАЛКОН — Статус*\n";
+    msg += "━━━━━━━━━━━━━━━━━━━━━\n\n";
+
+    msg += "⏱ Uptime: `" + String(upMin / 60) + "ч " + String(upMin % 60) + "м`\n";
+    msg += "📶 RSSI: `" + String(WiFi.RSSI()) + " dBm`\n";
+    msg += "🌐 IP: `" + WiFi.localIP().toString() + "`\n";
+    msg += "🧠 Heap: `" + String(ESP.getFreeHeap()) + " bytes`\n\n";
+
+    msg += "📡 *Датчики*\n";
+    msg += "  " + String(bmeReady ? "✅" : "❌") + " BME280 — stale `" + String(staleBmeCount) + "/" + String(STALE_BME_THRESHOLD) + "`\n";
+    msg += "  " + String(pmsIsAwake ? "🔆" : "😴") + " PMS5003 " + String(pmsIsAwake ? "активен" : "спит");
+    msg += " — stale `" + String(stalePmsCount) + "/" + String(STALE_PMS_THRESHOLD) + "`\n";
+    msg += "  🗄 Supabase — ошибок: `" + String(supabaseTotalErrors) + "`\n\n";
+
+    msg += "📝 *Показания*\n";
+    float t, h, p;
+    if (readClimate(t, h, p)) {
+      msg += "  🌡 `" + String(t, 1) + " °C`\n";
+      msg += "  💧 `" + String(h, 0) + " %`\n";
+      msg += "  📉 `" + String(p, 1) + " mmHg`\n";
+    }
+    if (hasPmsStats) {
+      msg += "  💨 PM2.5: `" + String((int)lastStatsPm25.median) + " мкг/м³`\n";
+    }
+
+    msg += "\n━━━━━━━━━━━━━━━━━━━━━";
+    sendTelegramMessage(msg);
+  }
+
+  if (payload.indexOf("/balcony_logs") >= 0) {
+    Serial.println("[Telegram] Получена команда /balcony_logs");
+    String msg = "📋 *БАЛКОН — Лог событий*\n";
+    msg += "━━━━━━━━━━━━━━━━━━━━━\n\n";
+    msg += eventLog.format();
+    msg += "\n━━━━━━━━━━━━━━━━━━━━━";
+    sendTelegramMessage(msg);
+  }
+
+  if (payload.indexOf("/balcony_errors") >= 0) {
+    Serial.println("[Telegram] Получена команда /balcony_errors");
+    String msg = "🚨 *БАЛКОН — Лог ошибок*\n";
+    msg += "━━━━━━━━━━━━━━━━━━━━━\n\n";
+    msg += errorLog.format();
+    msg += "\n━━━━━━━━━━━━━━━━━━━━━";
+    sendTelegramMessage(msg);
+  }
 }
 
 // ============================================================
@@ -728,6 +1047,15 @@ void updateLcd(uint8_t page) {
       lcd.print(climateBufferIndex);
       lcd.print('/');
       lcd.print(CLIMATE_BUFFER_SIZE);
+      break;
+    }
+
+    // ════════════════════════════════════════════
+    case LCD_PAGE_REBOOT: {
+      lcd.setCursor(0, 0);
+      lcd.print(F("Last reboot:"));
+      lcd.setCursor(0, 1);
+      lcd.print(rebootReasonShort);
       break;
     }
   }
