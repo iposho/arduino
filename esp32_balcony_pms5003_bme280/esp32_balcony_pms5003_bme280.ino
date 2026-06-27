@@ -6,6 +6,8 @@
 #include <PMS.h>
 #include <algorithm>
 #include <cmath>
+#include <esp_task_wdt.h>
+#include <BitBang_LiquidCrystal_I2C.h>
 
 // =====================
 // Секреты — вынесены в secrets.h (.gitignore)
@@ -18,6 +20,11 @@
 #define PMS_RX 16
 #define PMS_TX 17
 
+// Пины для RGB Светофора
+#define LED_R  25
+#define LED_G  26
+#define LED_Y  27   // Желтый (подписан B на плате, но реально Y)
+
 #define BME280_ADDR    0x76
 #define TEMP_MIN      -40.0f
 #define TEMP_MAX       80.0f
@@ -29,6 +36,21 @@
 
 #define PMS_TIMEOUT_MS   2000UL
 #define PMS_MAX_ERRORS      3
+#define WDT_TIMEOUT_SEC    15
+
+// Дисплей 1602A (16x2 LCD, I2C-адаптер PCF8574, bitbang)
+#define LCD_ADDR    0x27   // Часто 0x27 или 0x3F
+#define LCD_SDA     18
+#define LCD_SCL     19
+#define LCD_COLS    16
+#define LCD_ROWS    2
+
+// Страницы дисплея
+#define LCD_PAGE_SYSTEM    0   // WiFi + BME + PMS статус
+#define LCD_PAGE_AQI       1   // PM2.5 + цвет LED
+#define LCD_PAGE_TIMER     2   // Таймеры + буфер
+#define LCD_PAGE_COUNT     3
+#define LCD_PAGE_MS       3000UL // 3 сек на страницу
 
 // =====================
 // Тайминги
@@ -39,6 +61,7 @@ const unsigned long PMS_READ_INTERVAL     = 30UL * 60UL * 1000UL;  // 30 мин 
 const unsigned long PMS_WAKEUP_TIME       = 30UL * 1000UL;         // 30 сек — прогрев лазера
 const unsigned long PMS_SAMPLE_TIME       = 30UL * 1000UL;         // 30 сек — серия замеров
 const unsigned long PMS_SAMPLE_DELAY      = 1000UL;                // 1 сек между чтениями
+const unsigned long WIFI_TIMEOUT_REBOOT   = 10UL * 60UL * 1000UL;  // 10 минут без Wi-Fi -> ребут
 
 // =====================
 // PMS Accumulator — серия замеров со статистикой
@@ -112,6 +135,7 @@ struct PmsAccumulator {
 // Объекты и состояние
 // =====================
 Adafruit_BME280 bme;
+LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS, LCD_SDA, LCD_SCL);
 PMS pms(Serial2);
 PMS::DATA data;
 
@@ -125,6 +149,7 @@ unsigned long lastPmsReadTime      = 0;
 unsigned long pmsWakeupTargetTime  = 0;
 unsigned long pmsSamplingStartTime = 0;
 unsigned long pmsLastSampleTime    = 0;
+unsigned long lastWifiConnectedTime = 0;
 bool pmsSampling = false;
 
 PmsAccumulator pmsAcc;
@@ -148,6 +173,9 @@ bool    readClimate(float &t, float &h, float &p);
 bool    isClimateValid(float t, float h, float p);
 float   getMedian(float* array, int size);
 String  pmsStatsJson(const char* prefix, PmsStats &s);
+void    setLedColor(bool r, bool g, bool y);
+void    updateTrafficLight();
+void    updateLcd(uint8_t page);
 
 // ============================================================
 // SETUP
@@ -156,6 +184,29 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n--- Уличная метеостанция (Климат 5м / Пыль 30м) ---");
+
+  // Инициализация пинов светодиода
+  pinMode(LED_R, OUTPUT);
+  pinMode(LED_G, OUTPUT);
+  pinMode(LED_Y, OUTPUT);
+
+  // Инициализация LCD 1602A (bitbang I2C)
+  lcd.begin();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(F("System Booting.."));
+  Serial.println("[OK] LCD 1602A инициализирован.");
+  setLedColor(false, false, true); // Желтый на старте (прогрев)
+
+  // Настройка Hardware Watchdog
+  esp_task_wdt_config_t wdtConfig = {
+    .timeout_ms    = WDT_TIMEOUT_SEC * 1000UL,
+    .idle_core_mask = 0,
+    .trigger_panic  = true
+  };
+  esp_task_wdt_init(&wdtConfig);
+  esp_task_wdt_add(NULL);
 
   memset(&lastStatsPm1,  0, sizeof(PmsStats));
   memset(&lastStatsPm25, 0, sizeof(PmsStats));
@@ -183,20 +234,22 @@ void setup() {
 
   // --- Честный стартовый прогрев PMS (30 сек) + серия замеров ---
   if (WiFi.status() == WL_CONNECTED) {
+    lastWifiConnectedTime = millis();
     Serial.println("[Система] Старт полноценного прогрева PMS5003 для честного стартового замера...");
     pms.wakeUp();
-    
-    // Честно ждем 30 секунд, пока датчик прокачает воздух и стабилизирует лазер
+
     for (int i = 0; i < 30; i++) {
       delay(1000);
+      esp_task_wdt_reset(); // Не даем WDT сбросить плату во время долгого setup
       if (i % 5 == 0) Serial.printf("[Прогрев] Осталось %d сек...\n", 30 - i);
     }
 
-    // Серия замеров при старте (~30 сек, блокирующая — только в setup)
+    // Серия замеров при старте
     Serial.println("[PMS5003] Сбор честной стартовой серии...");
     pmsAcc.reset();
     unsigned long sStart = millis();
     while (millis() - sStart < PMS_SAMPLE_TIME && pmsAcc.count < PMS_SAMPLE_MAX) {
+      esp_task_wdt_reset();
       pms.requestRead();
       if (pms.readUntil(data, PMS_TIMEOUT_MS)) {
         pmsAcc.add(data.PM_AE_UG_1_0, data.PM_AE_UG_2_5, data.PM_AE_UG_10_0);
@@ -213,11 +266,19 @@ void setup() {
       pmsErrorCount = 0;
       Serial.printf("[PMS5003] Стартовая серия: n=%d, PM2.5 med=%.0f σ=%.1f\n",
                     lastStatsPm25.count, lastStatsPm25.median, lastStatsPm25.stddev);
+      updateTrafficLight();
     } else {
       pmsErrorCount++;
       Serial.println("[Предупреждение] PMS5003: 0 чтений при старте.");
+      setLedColor(true, false, false);
     }
     pms.sleep();
+
+    // Определение причины перезагрузки для Telegram
+    esp_reset_reason_t reason = esp_reset_reason();
+    String rebootReasonStr = "POWERON_RESET / Запуск";
+    if (reason == ESP_RST_WDT) rebootReasonStr = "🚨 WATCHDOG_RESET (Зависание системы)";
+    else if (reason == ESP_RST_SW) rebootReasonStr = "🔄 SOFTWARE_RESET (Отказ сети)";
 
     // Telegram Рапорт
     float sT = 0, sH = 0, sP = 0;
@@ -225,7 +286,7 @@ void setup() {
 
     String msg = "🤖 *СТАТУС: МЕТЕОСТАНЦИЯ БАЛКОН*\n";
     msg += "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n";
-    msg += "⚡ *Система:* `POWERON_RESET` / Запуск\n";
+    msg += "⚡ *Система:* `" + rebootReasonStr + "`\n";
     msg += "⏱ *Uptime:* `" + String(millis()) + " ms`\n";
     msg += "🌐 *IP:* `" + WiFi.localIP().toString() + "`\n";
     msg += "📶 *RSSI:* `" + String(WiFi.RSSI()) + " dBm`\n\n";
@@ -249,11 +310,9 @@ void setup() {
     }
     msg += "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬";
     sendTelegramMessage(msg);
-  } else {
-    Serial.println("[Telegram] Пропуск: нет Wi-Fi.");
   }
 
-  // Таймеры
+  // Выравнивание таймеров
   unsigned long now         = millis();
   lastClimateTickTime       = now - CLIMATE_TICK_INTERVAL;
   lastClimateSendTime       = now;
@@ -267,9 +326,30 @@ void setup() {
 // LOOP
 // ============================================================
 void loop() {
+  // СБРОС СТОРОЖЕВОГО ТАЙМЕРА (Кормим собаку)
+  esp_task_wdt_reset();
+
   unsigned long now = millis();
 
-  if (WiFi.status() != WL_CONNECTED) connectToWiFi();
+  // Контроль отвала Wi-Fi
+  if (WiFi.status() != WL_CONNECTED) {
+    connectToWiFi();
+    // Если Wi-Fi лежит слишком долго — принудительный ребут
+    if (now - lastWifiConnectedTime > WIFI_TIMEOUT_REBOOT) {
+      Serial.println("[Критическая ошибка] Сеть недоступна более 10 минут. Ребут!");
+      delay(500);
+      esp_restart();
+    }
+  } else {
+    lastWifiConnectedTime = now; // Сбрасываем таймер ошибки сети
+  }
+
+  // Профилактический суточный ребут (защита от утечек памяти)
+  if (now > 24UL * 60UL * 60UL * 1000UL) {
+    Serial.println("[Профилактика] Суточный перезапуск системы...");
+    delay(1000);
+    esp_restart();
+  }
 
   // ── 1. Климат в буфер каждые 30 сек ──
   if (now - lastClimateTickTime >= CLIMATE_TICK_INTERVAL) {
@@ -291,6 +371,7 @@ void loop() {
   if (!pmsIsAwake && !pmsSampling && (long)(now - pmsWakeupTargetTime) >= 0) {
     pms.wakeUp();
     pmsIsAwake = true;
+    setLedColor(false, false, true); // Желтый — прогрев лазера
     Serial.println("[PMS5003] Пробуждение лазера. Прогрев 30 сек...");
   }
 
@@ -330,9 +411,12 @@ void loop() {
         Serial.printf("[PMS5003] PM2.5: med=%.0f avg=%.1f σ=%.1f min=%.0f max=%.0f n=%d\n",
                       lastStatsPm25.median, lastStatsPm25.mean, lastStatsPm25.stddev,
                       lastStatsPm25.min, lastStatsPm25.max, lastStatsPm25.count);
+
+        updateTrafficLight();
       } else {
         pmsErrorCount++;
         Serial.printf("[PMS5003] 0 чтений! Ошибок подряд: %d\n", pmsErrorCount);
+        setLedColor(true, false, false);
         if (pmsErrorCount >= PMS_MAX_ERRORS) {
           String alert = "⚠️ *PMS5003 НЕ ОТВЕЧАЕТ*\nОшибок подряд: *";
           alert += String(pmsErrorCount) + "*\nПроверьте питание и UART.";
@@ -349,7 +433,18 @@ void loop() {
     }
   }
 
-  // ── 5. Отправка в Supabase каждые 5 мин ──
+  // ── 5. Обновление LCD 1602A (переключение страниц) ──
+  static unsigned long lastLcdUpdate  = 0;
+  static uint8_t       lcdPage        = 0;
+  if (now - lastLcdUpdate >= LCD_PAGE_MS) {
+    lastLcdUpdate = now;
+    if (pmsErrorCount == 0 && bmeReady) {
+      lcdPage = (lcdPage + 1) % LCD_PAGE_COUNT;  // цикл страниц
+    }
+    updateLcd(lcdPage);
+  }
+
+  // ── 6. Отправка в Supabase каждые 5 мин ──
   if (now - lastClimateSendTime >= CLIMATE_SEND_INTERVAL) {
     Serial.println("\n--- Отправка (5 мин) ---");
 
@@ -363,6 +458,7 @@ void loop() {
       if (!readClimate(fT, fH, fP)) {
         Serial.println("[Supabase] Нет климата — пропуск.");
         lastClimateSendTime = millis();
+        climateBufferIndex = 0;
         return;
       }
     }
@@ -372,6 +468,32 @@ void loop() {
   }
 
   delay(200);
+}
+
+// ============================================================
+// Управление светодиодами (Исправлено под R, Y, G)
+// ============================================================
+void setLedColor(bool r, bool g, bool y) {
+  digitalWrite(LED_R, r ? HIGH : LOW);
+  digitalWrite(LED_G, g ? HIGH : LOW);
+  digitalWrite(LED_Y, y ? HIGH : LOW);
+}
+
+void updateTrafficLight() {
+  if (!hasPmsStats) {
+    setLedColor(false, false, true); // Желтый — идет прогрев / нет данных
+    return;
+  }
+
+  float pm25 = lastStatsPm25.median;
+
+  if (pm25 <= 12.0f) {
+    setLedColor(false, true, false);  // Зеленый (Отлично)
+  } else if (pm25 <= 35.0f) {
+    setLedColor(true, true, false);   // Желтый (R + G = Смешиваются в желтый)
+  } else {
+    setLedColor(true, false, false);  // Красный (Плохо / Вредно)
+  }
 }
 
 // ============================================================
@@ -420,7 +542,7 @@ String pmsStatsJson(const char* prefix, PmsStats &s) {
 }
 
 // ============================================================
-// Supabase POST — климат + PMS stats
+// Supabase POST
 // ============================================================
 void sendDataToSupabase(float t, float h, float p) {
   if (WiFi.status() != WL_CONNECTED) return;
@@ -442,7 +564,10 @@ void sendDataToSupabase(float t, float h, float p) {
     json += pmsStatsJson("pm2_5",  lastStatsPm25) + ",";
     json += pmsStatsJson("pm10_0", lastStatsPm10);
   } else {
-    json += "\"pm1_0\":0,\"pm2_5\":0,\"pm10_0\":0";
+    PmsStats nullStats = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0};
+    json += pmsStatsJson("pm1_0",  nullStats)  + ",";
+    json += pmsStatsJson("pm2_5",  nullStats) + ",";
+    json += pmsStatsJson("pm10_0", nullStats);
   }
   json += "}";
 
@@ -463,8 +588,12 @@ void connectToWiFi() {
   Serial.print("Wi-Fi... ");
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   int att = 0;
+  // Неблокирующее ожидание внутри функции, чтобы WDT не сработал при долгом подключении
   while (WiFi.status() != WL_CONNECTED && att < 20) {
-    delay(500); Serial.print("."); att++;
+    esp_task_wdt_reset();
+    delay(500);
+    Serial.print(".");
+    att++;
   }
   if (WiFi.status() == WL_CONNECTED)
     Serial.printf(" OK! %s\n", WiFi.localIP().toString().c_str());
@@ -496,4 +625,110 @@ void sendTelegramMessage(String message) {
   if (code > 0) Serial.printf("[Telegram] %d\n", code);
   else          Serial.printf("[Telegram] ERR: %s\n", http.errorToString(code).c_str());
   http.end();
+}
+
+// ============================================================
+// LCD 1602A — статус системы (16x2, страницы)
+// ============================================================
+void updateLcd(uint8_t page) {
+  lcd.clear();
+  unsigned long now = millis();
+
+  if (pmsErrorCount > 0 || !bmeReady) {
+    // ═══ Аварийная страница ═══
+    lcd.setCursor(0, 0);
+    lcd.print(F("*** ALERT ***"));
+    lcd.setCursor(0, 1);
+    if (!bmeReady)      lcd.print(F("BME280 FAIL"));
+    else {
+      lcd.print(F("PMS ERR x"));
+      lcd.print(pmsErrorCount);
+    }
+    return;
+  }
+
+  // Текущее название цвета LED
+  const char* ledName;
+  if (!hasPmsStats)      ledName = "YELLOW";
+  else {
+    float pm25 = lastStatsPm25.median;
+    if (pm25 <= 12.0f)      ledName = "GREEN";
+    else if (pm25 <= 35.0f) ledName = "YELLOW";
+    else                    ledName = "RED";
+  }
+
+  switch (page) {
+    // ════════════════════════════════════════════
+    case LCD_PAGE_SYSTEM: {
+      lcd.setCursor(0, 0);
+      if (WiFi.status() == WL_CONNECTED) {
+        lcd.print(F("WiFi:OK "));
+        lcd.print(WiFi.RSSI());
+        lcd.print(F("dBm"));
+      } else {
+        lcd.print(F("WiFi:DOWN    "));
+      }
+
+      lcd.setCursor(0, 1);
+      lcd.print(F("BME:"));
+      lcd.print(bmeReady ? "OK " : "ERR");
+      lcd.print(F(" PMS:"));
+      if (pmsSampling)      lcd.print(F("SAMP"));
+      else if (pmsIsAwake)  lcd.print(F("WARM"));
+      else                  lcd.print(F("SLP "));
+      break;
+    }
+
+    // ════════════════════════════════════════════
+    case LCD_PAGE_AQI: {
+      lcd.setCursor(0, 0);
+      lcd.print(F("PM2.5: "));
+      if (hasPmsStats) {
+        lcd.print((int)lastStatsPm25.median);
+        lcd.print(F(" ug/m3"));
+      } else {
+        lcd.print(F("--- ug/m3"));
+      }
+
+      lcd.setCursor(0, 1);
+      lcd.print(F("LED: "));
+      lcd.print(ledName);
+      break;
+    }
+
+    // ════════════════════════════════════════════
+    case LCD_PAGE_TIMER: {
+      lcd.setCursor(0, 0);
+      if (!pmsIsAwake && !pmsSampling) {
+        lcd.print(F("Next: "));
+        if (now < pmsWakeupTargetTime) {
+          unsigned long sec = (pmsWakeupTargetTime - now) / 1000UL;
+          if (sec >= 60) { lcd.print(sec / 60); lcd.print('m'); lcd.print(' '); }
+          lcd.print(sec % 60);
+          lcd.print('s');
+        } else {
+          lcd.print(F("NOW     "));
+        }
+      } else if (pmsSampling) {
+        lcd.print(F("> SAMPLING <"));
+      } else {
+        lcd.print(F("> WARMUP <"));
+      }
+
+      lcd.setCursor(0, 1);
+      lcd.print(F("Up:"));
+      {
+        unsigned long up = millis() / 60000UL;
+        lcd.print(up / 60);
+        lcd.print('h');
+        lcd.print(up % 60);
+        lcd.print('m');
+      }
+      lcd.print(F(" Buf:"));
+      lcd.print(climateBufferIndex);
+      lcd.print('/');
+      lcd.print(CLIMATE_BUFFER_SIZE);
+      break;
+    }
+  }
 }
