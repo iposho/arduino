@@ -24,3 +24,8 @@ libraries/
 # OS
 .DS_Store
 Thumbs.db
+.history/
+
+
+# AI
+.claude/

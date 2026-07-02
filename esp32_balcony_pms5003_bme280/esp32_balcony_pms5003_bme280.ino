@@ -1,5 +1,8 @@
 #include <WiFi.h>
+#include <PubSubClient.h>
+#include <WebServer.h>
 #include <HTTPClient.h>
+#include <ArduinoJson.h>
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
@@ -7,7 +10,11 @@
 #include <algorithm>
 #include <cmath>
 #include <esp_task_wdt.h>
-#include <BitBang_LiquidCrystal_I2C.h>
+#include <esp_system.h>
+#include <stdint.h>
+#include <time.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
 // =====================
 // Секреты — вынесены в secrets.h (.gitignore)
@@ -36,22 +43,36 @@
 
 #define PMS_TIMEOUT_MS   2000UL
 #define PMS_MAX_ERRORS      3
-#define WDT_TIMEOUT_SEC    15
+#define WDT_TIMEOUT_SEC    30
+#define HTTP_TIMEOUT_MS    8000UL
 
-// Дисплей 1602A (16x2 LCD, I2C-адаптер PCF8574, bitbang)
-#define LCD_ADDR    0x27   // Часто 0x27 или 0x3F
-#define LCD_SDA     18
-#define LCD_SCL     19
-#define LCD_COLS    16
-#define LCD_ROWS    2
+// NTP (UTC+4)
+#define NTP_SERVER         "pool.ntp.org"
+#define GMT_OFFSET_SEC     (4 * 3600)
+#define DAYLIGHT_OFFSET    0
+
+// OLED SSD1306 128x64 (отдельная I2C шина, пины 18/19)
+#define OLED_ADDR       0x3C
+#define OLED_SDA        18
+#define OLED_SCL        19
+#define SCREEN_WIDTH    128
+#define SCREEN_HEIGHT   64
+#define OLED_RESET      -1
 
 // Страницы дисплея
-#define LCD_PAGE_SYSTEM    0   // WiFi + BME + PMS статус
-#define LCD_PAGE_AQI       1   // PM2.5 + цвет LED
-#define LCD_PAGE_TIMER     2   // Таймеры + буфер
-#define LCD_PAGE_REBOOT    3   // Причина последнего ребута
-#define LCD_PAGE_COUNT     4
-#define LCD_PAGE_MS       5000UL // 5 сек на страницу
+#define OLED_PAGE_CLIMATE   0   // Показания BME280 + расписание замеров
+#define OLED_PAGE_DUST      1   // PM1/2.5/10 + расписание PMS
+#define OLED_PAGE_CLOUD     2   // Отправка в Supabase
+#define OLED_PAGE_HARDWARE  3   // Состояние датчиков и сети
+#define OLED_PAGE_SYSTEM    4   // CPU, uptime, ребут
+#define OLED_PAGE_COUNT     5
+#define OLED_PAGE_MS       5000UL
+#define OLED_STATUS_HOLD_MS 5000UL
+
+// Встроенный LED на ESP32 DevKit (GPIO 2, active LOW) — отдельно от светофора R/Y/G
+#ifndef LED_BUILTIN
+#define LED_BUILTIN 2
+#endif
 
 // =====================
 // Тайминги
@@ -63,6 +84,7 @@ const unsigned long PMS_WAKEUP_TIME       = 30UL * 1000UL;         // 30 сек 
 const unsigned long PMS_SAMPLE_TIME       = 30UL * 1000UL;         // 30 сек — серия замеров
 const unsigned long PMS_SAMPLE_DELAY      = 1000UL;                // 1 сек между чтениями
 const unsigned long WIFI_TIMEOUT_REBOOT   = 10UL * 60UL * 1000UL;  // 10 минут без Wi-Fi -> ребут
+const unsigned long MQTT_TELEMETRY_INTERVAL = 10UL * 1000UL;
 
 // =====================
 // PMS Accumulator — серия замеров со статистикой
@@ -138,6 +160,7 @@ struct PmsAccumulator {
 #define LOG_ENTRY_LEN    64
 #define EVENT_LOG_SIZE   15
 #define ERROR_LOG_SIZE   10
+#define RTC_ERROR_LOG_SIZE  8
 
 struct RingLog {
   char     entries[20][LOG_ENTRY_LEN];
@@ -182,7 +205,8 @@ RingLog errorLog;
 // Объекты и состояние
 // =====================
 Adafruit_BME280 bme;
-LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS, LCD_SDA, LCD_SCL);
+TwoWire oledWire(1);
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &oledWire, OLED_RESET);
 PMS pms(Serial2);
 PMS::DATA data;
 
@@ -220,13 +244,59 @@ float lastPmsMedian = -1.0f;
 int   stalePmsCount = 0;
 const int STALE_PMS_THRESHOLD = 6;    // 6 x 30 мин = 3 часа одинаковых медиан
 
-// Причина последнего ребута (для LCD)
-char rebootReasonShort[17] = "";  // 16 символов LCD + '\0'
+// Критический уровень PM2.5 — мигающий красный
+bool pmsCriticalBlink = false;
+
+// Причина последнего ребута
+char rebootReasonShort[17] = "";
+
+// Программные причины ребута (сохраняются в RTC между esp_restart)
+enum RebootCause : int {
+  REBOOT_NONE        = 0,
+  REBOOT_WIFI_TIMEOUT = 1,
+  REBOOT_DAILY       = 2,
+  REBOOT_BME_STALE   = 3,
+  REBOOT_PMS_STALE   = 4,
+  REBOOT_TELEGRAM    = 5,
+  REBOOT_MQTT        = 6,
+};
+
+#define REBOOT_RTC_MAGIC  0xEB00C001UL
+
+RTC_DATA_ATTR static uint32_t rtcRebootMagic     = 0;
+RTC_DATA_ATTR static int      rtcRebootCode      = REBOOT_NONE;
+RTC_DATA_ATTR static uint32_t rtcRebootUptime    = 0;
+RTC_DATA_ATTR static uint32_t rtcRebootHeap      = 0;
+RTC_DATA_ATTR static int      rtcRebootStalePms  = 0;
+RTC_DATA_ATTR static int      rtcRebootStaleBme  = 0;
+RTC_DATA_ATTR static uint32_t rtcRebootMinHeap   = 0;
+RTC_DATA_ATTR static uint32_t rtcLastLoopMs      = 0;
+
+// Лог ошибок в RTC — переживает esp_restart и watchdog
+RTC_DATA_ATTR static int      rtcErrorHead  = 0;
+RTC_DATA_ATTR static int      rtcErrorCount = 0;
+RTC_DATA_ATTR static char     rtcErrorEntries[RTC_ERROR_LOG_SIZE][LOG_ENTRY_LEN];
+RTC_DATA_ATTR static uint32_t rtcErrorUptime[RTC_ERROR_LOG_SIZE];
+
+// Минимальный heap за сессию (обновляется в loop)
+uint32_t sessionMinHeap = UINT32_MAX;
 
 // Ошибки Supabase
 int  supabaseErrorCount = 0;
 int  supabaseTotalErrors = 0;
 const int SUPABASE_MAX_ERRORS = 3;
+
+// NTP — время загрузки и метки последних апдейтов
+char bootTimeStr[20]           = "---";
+char lastClimateTimeStr[20]    = "---";
+char lastPmsTimeStr[20]        = "---";
+char lastCloudSendTimeStr[20]  = "---";
+bool ntpSynced = false;
+
+float lastClimateTemp = 0.0f;
+float lastClimateHum  = 0.0f;
+float lastClimatePres = 0.0f;
+bool  hasClimateReading = false;
 
 // Telegram-команды (удалённый ребут/статус)
 unsigned long lastTelegramCheckTime = 0;
@@ -234,8 +304,35 @@ const unsigned long TELEGRAM_CHECK_INTERVAL = 60UL * 1000UL;
 long telegramUpdateId = 0;
 bool telegramOffsetInit = false;
 
+WebServer statusServer(80);
+bool webServerStarted = false;
+
+WiFiClient mqttNet;
+PubSubClient mqttClient(mqttNet);
+
+char topicStatus[64];
+char topicTelemetry[64];
+char topicCommand[64];
+bool mqttTopicsReady = false;
+unsigned long lastMqttTelemetry = 0;
+
+uint8_t oledPage = 0;
+unsigned long lastOledUpdate = 0;
+bool oledStatusHold = false;
+unsigned long oledStatusHoldStart = 0;
+bool boardLedOn = false;
+
 // Forward declarations
 void    connectToWiFi();
+void    startWebServer();
+void    ensureWebServer();
+void    handleStatusPage();
+void    initMqttTopics();
+void    handleMqttCommand(char* topic, byte* payload, unsigned int length);
+void    setBoardLed(bool on);
+void    showStatusScreen();
+void    ensureMqtt();
+void    publishMqttTelemetry();
 void    sendDataToSupabase(float t, float h, float p);
 void    sendTelegramMessage(String message);
 bool    readClimate(float &t, float &h, float &p);
@@ -244,8 +341,24 @@ float   getMedian(float* array, int size);
 String  pmsStatsJson(const char* prefix, PmsStats &s);
 void    setLedColor(bool r, bool g, bool y);
 void    updateTrafficLight();
-void    updateLcd(uint8_t page);
+void    updateOled(uint8_t page);
 void    checkTelegramCommands();
+void    updateTimeStr(char* buf, size_t len);
+void    formatClockShort(char* buf, size_t len);
+void    formatNextWallTime(unsigned long targetMs, unsigned long nowMs, char* buf, size_t len);
+void    formatCountdown(unsigned long targetMs, unsigned long nowMs, char* buf, size_t len);
+unsigned long nextPmsCompleteTime();
+void    oledDrawHeader(uint8_t page, const char* title);
+void    oledDrawLine(int y);
+void    requestReboot(RebootCause cause);
+String  resetReasonLabel(esp_reset_reason_t reason);
+String  rebootCauseLabel(RebootCause cause);
+String  formatUptime(unsigned long ms);
+String  buildRebootDebugBlock(esp_reset_reason_t hwReason);
+void    logError(const char* text);
+void    rtcErrorPersist(const char* text, uint32_t uptimeMs);
+String  formatRtcErrorLog();
+void    setupHttpClient(HTTPClient &http);
 
 // ============================================================
 // SETUP
@@ -258,50 +371,74 @@ void setup() {
   eventLog.init(EVENT_LOG_SIZE);
   errorLog.init(ERROR_LOG_SIZE);
 
-  // Инициализация пинов светодиода
+  esp_reset_reason_t rstReason = esp_reset_reason();
+  if (rstReason != ESP_RST_SW) rtcRebootMagic = 0;
+  sessionMinHeap = ESP.getFreeHeap();
+
   pinMode(LED_R, OUTPUT);
   pinMode(LED_G, OUTPUT);
   pinMode(LED_Y, OUTPUT);
+  pinMode(LED_BUILTIN, OUTPUT);
+  setBoardLed(false);
 
-  // Инициализация LCD 1602A (bitbang I2C)
-  lcd.begin();
-  lcd.backlight();
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print(F("System Booting.."));
-  Serial.println("[OK] LCD 1602A инициализирован.");
+  // Инициализация OLED SSD1306 128x64 (отдельная I2C шина на пинах 18/19)
+  oledWire.begin(OLED_SDA, OLED_SCL);
+  if (display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println(F("System Booting..."));
+    display.display();
+    Serial.println("[OK] OLED SSD1306 инициализирован.");
+  } else {
+    Serial.println("[Ошибка] OLED SSD1306 не найден!");
+  }
   setLedColor(false, false, true); // Желтый на старте (прогрев)
-
-  // Настройка Hardware Watchdog
-  esp_task_wdt_config_t wdtConfig = {
-    .timeout_ms    = WDT_TIMEOUT_SEC * 1000UL,
-    .idle_core_mask = 0,
-    .trigger_panic  = true
-  };
-  esp_task_wdt_init(&wdtConfig);
-  esp_task_wdt_add(NULL);
 
   memset(&lastStatsPm1,  0, sizeof(PmsStats));
   memset(&lastStatsPm25, 0, sizeof(PmsStats));
   memset(&lastStatsPm10, 0, sizeof(PmsStats));
 
   // --- Причина ребута (сохраняем для LCD) ---
-  esp_reset_reason_t rstReason = esp_reset_reason();
   switch (rstReason) {
-    case ESP_RST_POWERON:  strncpy(rebootReasonShort, "POWER ON",    16); break;
-    case ESP_RST_SW:       strncpy(rebootReasonShort, "SOFTWARE RST", 16); break;
-    case ESP_RST_WDT:      strncpy(rebootReasonShort, "WATCHDOG!",   16); break;
-    case ESP_RST_PANIC:    strncpy(rebootReasonShort, "PANIC!",      16); break;
-    case ESP_RST_BROWNOUT: strncpy(rebootReasonShort, "BROWNOUT!",   16); break;
-    case ESP_RST_DEEPSLEEP:strncpy(rebootReasonShort, "DEEP SLEEP",  16); break;
-    default:               strncpy(rebootReasonShort, "UNKNOWN",     16); break;
+    case ESP_RST_UNKNOWN:    strncpy(rebootReasonShort, "UNK HW",      16); break;
+    case ESP_RST_POWERON:    strncpy(rebootReasonShort, "POWER ON",    16); break;
+    case ESP_RST_EXT:        strncpy(rebootReasonShort, "EXT PIN",     16); break;
+    case ESP_RST_SW:         strncpy(rebootReasonShort, "SOFTWARE",    16); break;
+    case ESP_RST_PANIC:      strncpy(rebootReasonShort, "PANIC!",      16); break;
+    case ESP_RST_INT_WDT:    strncpy(rebootReasonShort, "INT WDT!",    16); break;
+    case ESP_RST_TASK_WDT:   strncpy(rebootReasonShort, "TASK WDT!",   16); break;
+    case ESP_RST_WDT:        strncpy(rebootReasonShort, "WDT!",        16); break;
+    case ESP_RST_DEEPSLEEP:  strncpy(rebootReasonShort, "DEEP SLEEP",  16); break;
+    case ESP_RST_BROWNOUT:   strncpy(rebootReasonShort, "BROWNOUT!",   16); break;
+    case ESP_RST_SDIO:       strncpy(rebootReasonShort, "SDIO",        16); break;
+    default:                 strncpy(rebootReasonShort, "OTHER",       16); break;
+  }
+
+  Serial.printf("[Reboot] HW reason: %s (code %d)\n",
+                resetReasonLabel(rstReason).c_str(), (int)rstReason);
+  if (rstReason == ESP_RST_SW && rtcRebootMagic == REBOOT_RTC_MAGIC) {
+    Serial.printf("[Reboot] SW reason: %s, prev uptime: %s, heap: %lu, minHeap: %lu\n",
+                  rebootCauseLabel((RebootCause)rtcRebootCode).c_str(),
+                  formatUptime(rtcRebootUptime).c_str(),
+                  (unsigned long)rtcRebootHeap,
+                  (unsigned long)rtcRebootMinHeap);
+    Serial.printf("[Reboot] stale PMS: %d, stale BME: %d\n",
+                  rtcRebootStalePms, rtcRebootStaleBme);
+  } else if (rstReason != ESP_RST_POWERON && rstReason != ESP_RST_SW) {
+    char buf[LOG_ENTRY_LEN];
+    snprintf(buf, sizeof(buf), "HW RESET: %s (#%d) @%s",
+             resetReasonLabel(rstReason).c_str(), (int)rstReason,
+             formatUptime(rtcLastLoopMs).c_str());
+    logError(buf);
   }
 
   // --- BME280 ---
   bmeReady = bme.begin(BME280_ADDR, &Wire);
   Serial.println(bmeReady ? "[ОК] BME280 инициализирован." : "[Ошибка] BME280 не найден!");
   eventLog.add(bmeReady ? "BME280 OK" : "BME280 FAIL");
-  if (!bmeReady) errorLog.add("BME280 не найден при старте");
+  if (!bmeReady) logError("BME280 не найден при старте");
 
   // --- PMS5003 ---
   Serial2.begin(9600, SERIAL_8N1, PMS_RX, PMS_TX);
@@ -323,12 +460,27 @@ void setup() {
   if (WiFi.status() == WL_CONNECTED) {
     eventLog.add("WiFi OK");
     lastWifiConnectedTime = millis();
+    ensureWebServer();
+    ensureMqtt();
+
+    // NTP-синхронизация
+    configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET, NTP_SERVER);
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo, 5000)) {
+      ntpSynced = true;
+      updateTimeStr(bootTimeStr, sizeof(bootTimeStr));
+      Serial.printf("[NTP] Синхронизировано: %s\n", bootTimeStr);
+      eventLog.add("NTP OK");
+    } else {
+      Serial.println("[NTP] Не удалось синхронизировать время");
+      logError("NTP sync FAIL");
+    }
+
     Serial.println("[Система] Старт полноценного прогрева PMS5003 для честного стартового замера...");
     pms.wakeUp();
 
     for (int i = 0; i < 30; i++) {
       delay(1000);
-      esp_task_wdt_reset(); // Не даем WDT сбросить плату во время долгого setup
       if (i % 5 == 0) Serial.printf("[Прогрев] Осталось %d сек...\n", 30 - i);
     }
 
@@ -337,7 +489,6 @@ void setup() {
     pmsAcc.reset();
     unsigned long sStart = millis();
     while (millis() - sStart < PMS_SAMPLE_TIME && pmsAcc.count < PMS_SAMPLE_MAX) {
-      esp_task_wdt_reset();
       pms.requestRead();
       if (pms.readUntil(data, PMS_TIMEOUT_MS)) {
         pmsAcc.add(data.PM_AE_UG_1_0, data.PM_AE_UG_2_5, data.PM_AE_UG_10_0);
@@ -352,6 +503,7 @@ void setup() {
       lastStatsPm10 = pmsAcc.statsPm10();
       hasPmsStats   = true;
       pmsErrorCount = 0;
+      if (ntpSynced) updateTimeStr(lastPmsTimeStr, sizeof(lastPmsTimeStr));
       Serial.printf("[PMS5003] Стартовая серия: n=%d, PM2.5 med=%.0f σ=%.1f\n",
                     lastStatsPm25.count, lastStatsPm25.median, lastStatsPm25.stddev);
       char buf[LOG_ENTRY_LEN];
@@ -361,17 +513,27 @@ void setup() {
     } else {
       pmsErrorCount++;
       Serial.println("[Предупреждение] PMS5003: 0 чтений при старте.");
-      errorLog.add("PMS5003: 0 чтений при старте");
+      logError("PMS5003: 0 чтений при старте");
       setLedColor(true, false, false);
     }
     pms.sleep();
 
-    // Причина перезагрузки для Telegram (детальнее чем LCD)
-    String rebootReasonStr = String(rebootReasonShort);
-    if (rstReason == ESP_RST_WDT)   rebootReasonStr = "🚨 WATCHDOG (Зависание)";
-    else if (rstReason == ESP_RST_SW)      rebootReasonStr = "🔄 SOFTWARE (Программный)";
-    else if (rstReason == ESP_RST_PANIC)   rebootReasonStr = "💥 PANIC (Критическая)";
-    else if (rstReason == ESP_RST_BROWNOUT) rebootReasonStr = "⚡ BROWNOUT (Питание)";
+    // Сброс RTC-метки — после формирования сообщения
+    String rebootReasonStr = resetReasonLabel(rstReason);
+    if (rstReason == ESP_RST_SW && rtcRebootMagic == REBOOT_RTC_MAGIC) {
+      rebootReasonStr = "🔄 " + rebootCauseLabel((RebootCause)rtcRebootCode);
+    } else if (rstReason == ESP_RST_WDT || rstReason == ESP_RST_TASK_WDT || rstReason == ESP_RST_INT_WDT) {
+      rebootReasonStr = "🚨 WATCHDOG (" + resetReasonLabel(rstReason) + ")";
+    } else if (rstReason == ESP_RST_PANIC) {
+      rebootReasonStr = "💥 PANIC";
+    } else if (rstReason == ESP_RST_BROWNOUT) {
+      rebootReasonStr = "⚡ BROWNOUT";
+    } else if (rstReason == ESP_RST_POWERON) {
+      rebootReasonStr = "🔌 POWER ON";
+    }
+
+    String debugBlock = buildRebootDebugBlock(rstReason);
+    rtcRebootMagic = 0;
 
     // Telegram Рапорт
     float sT = 0, sH = 0, sP = 0;
@@ -380,6 +542,7 @@ void setup() {
     String msg = "🤖 *МЕТЕОСТАНЦИЯ БАЛКОН — ЗАПУСК*\n";
     msg += "━━━━━━━━━━━━━━━━━━━━━\n\n";
     msg += "⚡ *Причина:* `" + rebootReasonStr + "`\n";
+    msg += debugBlock;
     msg += "⏱ Uptime: `" + String(millis()) + " ms`\n";
     msg += "🌐 IP: `" + WiFi.localIP().toString() + "`\n";
     msg += "📶 RSSI: `" + String(WiFi.RSSI()) + " dBm`\n\n";
@@ -402,6 +565,10 @@ void setup() {
       msg += ", σ=" + String(lastStatsPm25.stddev, 1);
       msg += ", " + String((int)lastStatsPm25.min) + "–" + String((int)lastStatsPm25.max) + ")\n";
     }
+    if (rtcErrorCount > 0) {
+      msg += "\n🚨 *Ошибки прошлой сессии (RTC):*\n";
+      msg += formatRtcErrorLog();
+    }
     msg += "\n━━━━━━━━━━━━━━━━━━━━━";
     sendTelegramMessage(msg);
   }
@@ -411,6 +578,15 @@ void setup() {
   lastClimateTickTime       = now - CLIMATE_TICK_INTERVAL;
   lastClimateSendTime       = now;
   pmsWakeupTargetTime       = now + PMS_READ_INTERVAL - PMS_WAKEUP_TIME - PMS_SAMPLE_TIME;
+
+  // Watchdog включаем только после долгого setup (PMS прогрев ~60 сек)
+  esp_task_wdt_config_t wdtConfig = {
+    .timeout_ms     = WDT_TIMEOUT_SEC * 1000UL,
+    .idle_core_mask = 0,
+    .trigger_panic  = true
+  };
+  esp_task_wdt_init(&wdtConfig);
+  esp_task_wdt_add(NULL);
 
   Serial.println("[Система] Вход в рабочий цикл.");
 }
@@ -423,6 +599,10 @@ void loop() {
   esp_task_wdt_reset();
 
   unsigned long now = millis();
+  rtcLastLoopMs = now;
+
+  uint32_t heap = ESP.getFreeHeap();
+  if (heap < sessionMinHeap) sessionMinHeap = heap;
 
   // Контроль отвала Wi-Fi
   if (WiFi.status() != WL_CONNECTED) {
@@ -430,13 +610,23 @@ void loop() {
     // Если Wi-Fi лежит слишком долго — принудительный ребут
     if (now - lastWifiConnectedTime > WIFI_TIMEOUT_REBOOT) {
       Serial.println("[Критическая ошибка] Сеть недоступна более 10 минут. Ребут!");
-      errorLog.add("WiFi таймаут 10м -> ребут");
+      logError("WiFi таймаут 10м -> ребут");
       delay(500);
-      esp_restart();
+      requestReboot(REBOOT_WIFI_TIMEOUT);
     }
   } else {
     lastWifiConnectedTime = now; // Сбрасываем таймер ошибки сети
+    ensureWebServer();
+    ensureMqtt();
+    mqttClient.loop();
+
+    if (now - lastMqttTelemetry >= MQTT_TELEMETRY_INTERVAL) {
+      lastMqttTelemetry = now;
+      publishMqttTelemetry();
+    }
   }
+
+  statusServer.handleClient();
 
   // Профилактический суточный ребут (защита от утечек памяти)
   if (now > 24UL * 60UL * 60UL * 1000UL) {
@@ -449,7 +639,7 @@ void loop() {
     msg += "━━━━━━━━━━━━━━━━━━━━━";
     sendTelegramMessage(msg);
     delay(1000);
-    esp_restart();
+    requestReboot(REBOOT_DAILY);
   }
 
   // ── 1. Климат в буфер каждые 30 сек ──
@@ -464,6 +654,11 @@ void loop() {
         Serial.printf("[Буфер климата] %d/%d -> T:%.1f P:%.1f\n",
                       climateBufferIndex + 1, CLIMATE_BUFFER_SIZE, t, p);
         climateBufferIndex++;
+        lastClimateTemp = t;
+        lastClimateHum  = h;
+        lastClimatePres = p;
+        hasClimateReading = true;
+        if (ntpSynced) updateTimeStr(lastClimateTimeStr, sizeof(lastClimateTimeStr));
 
         // Детекция залипшего BME280
         if (t == lastBmeTemp) {
@@ -472,7 +667,7 @@ void loop() {
             Serial.printf("[STALE] BME280 завис: %.2f°C x%d раз\n", t, staleBmeCount);
             char buf[LOG_ENTRY_LEN];
             snprintf(buf, sizeof(buf), "BME280 STALE %.2f°C x%d -> ребут", t, staleBmeCount);
-            errorLog.add(buf);
+            logError(buf);
             String msg = "🚨 *БАЛКОН — BME280 ЗАВИС*\n";
             msg += "━━━━━━━━━━━━━━━━━━━━━\n\n";
             msg += "🌡 Температура: `" + String(t, 2) + " °C`\n";
@@ -481,7 +676,7 @@ void loop() {
             msg += "━━━━━━━━━━━━━━━━━━━━━";
             sendTelegramMessage(msg);
             delay(1000);
-            esp_restart();
+            requestReboot(REBOOT_BME_STALE);
           }
         } else {
           staleBmeCount = 0;
@@ -495,7 +690,6 @@ void loop() {
   if (!pmsIsAwake && !pmsSampling && (long)(now - pmsWakeupTargetTime) >= 0) {
     pms.wakeUp();
     pmsIsAwake = true;
-    setLedColor(false, false, true); // Желтый — прогрев лазера
     Serial.println("[PMS5003] Пробуждение лазера. Прогрев 30 сек...");
   }
 
@@ -531,6 +725,7 @@ void loop() {
         lastStatsPm10 = pmsAcc.statsPm10();
         hasPmsStats   = true;
         pmsErrorCount = 0;
+        if (ntpSynced) updateTimeStr(lastPmsTimeStr, sizeof(lastPmsTimeStr));
 
         // Детекция залипшего PMS5003
         if (lastStatsPm25.median == lastPmsMedian && lastPmsMedian >= 0) {
@@ -540,7 +735,7 @@ void loop() {
                           lastPmsMedian, stalePmsCount);
             char buf[LOG_ENTRY_LEN];
             snprintf(buf, sizeof(buf), "PMS STALE PM2.5=%.0f x%d -> ребут", lastPmsMedian, stalePmsCount);
-            errorLog.add(buf);
+            logError(buf);
             String msg = "🚨 *БАЛКОН — PMS5003 ЗАВИС*\n";
             msg += "━━━━━━━━━━━━━━━━━━━━━\n\n";
             msg += "💨 PM2.5: `" + String((int)lastPmsMedian) + " мкг/м³`\n";
@@ -549,7 +744,7 @@ void loop() {
             msg += "━━━━━━━━━━━━━━━━━━━━━";
             sendTelegramMessage(msg);
             delay(1000);
-            esp_restart();
+            requestReboot(REBOOT_PMS_STALE);
           }
         } else {
           stalePmsCount = 0;
@@ -571,7 +766,7 @@ void loop() {
         Serial.printf("[PMS5003] 0 чтений! Ошибок подряд: %d\n", pmsErrorCount);
         char buf[LOG_ENTRY_LEN];
         snprintf(buf, sizeof(buf), "PMS 0 чтений (подряд: %d)", pmsErrorCount);
-        errorLog.add(buf);
+        logError(buf);
         setLedColor(true, false, false);
         if (pmsErrorCount >= PMS_MAX_ERRORS) {
           String alert = "🚨 *БАЛКОН — PMS5003 НЕ ОТВЕЧАЕТ*\n";
@@ -591,18 +786,31 @@ void loop() {
     }
   }
 
-  // ── 5. Обновление LCD 1602A (переключение страниц) ──
-  static unsigned long lastLcdUpdate  = 0;
-  static uint8_t       lcdPage        = 0;
-  if (now - lastLcdUpdate >= LCD_PAGE_MS) {
-    lastLcdUpdate = now;
-    if (pmsErrorCount == 0 && bmeReady) {
-      lcdPage = (lcdPage + 1) % LCD_PAGE_COUNT;  // цикл страниц
-    }
-    updateLcd(lcdPage);
+  // ── 5. Мигающие светодиоды ──
+  if (pmsCriticalBlink) {
+    bool blinkOn = (now / 300) % 2 == 0;
+    setLedColor(blinkOn, false, false);       // Мигающий красный — опасный уровень
+  } else if (pmsIsAwake || pmsSampling) {
+    bool blinkOn = (now / 500) % 2 == 0;
+    setLedColor(false, false, blinkOn);       // Мигающий жёлтый — прогрев/замеры
   }
 
-  // ── 6. Отправка в Supabase каждые 5 мин ──
+  // ── 6. Обновление OLED (переключение страниц) ──
+  if (oledStatusHold) {
+    if (now - oledStatusHoldStart >= OLED_STATUS_HOLD_MS) {
+      oledStatusHold = false;
+      lastOledUpdate = now;
+      updateOled(oledPage);
+    }
+  } else if (now - lastOledUpdate >= OLED_PAGE_MS) {
+    lastOledUpdate = now;
+    if (pmsErrorCount == 0 && bmeReady) {
+      oledPage = (oledPage + 1) % OLED_PAGE_COUNT;
+    }
+    updateOled(oledPage);
+  }
+
+  // ── 7. Отправка в Supabase каждые 5 мин ──
   if (now - lastClimateSendTime >= CLIMATE_SEND_INTERVAL) {
     Serial.println("\n--- Отправка (5 мин) ---");
 
@@ -625,7 +833,7 @@ void loop() {
     lastClimateSendTime = millis();
   }
 
-  // ── 7. Telegram-команды (удалённый ребут/статус) ──
+  // ── 8. Telegram-команды (удалённый ребут/статус) ──
   if (now - lastTelegramCheckTime >= TELEGRAM_CHECK_INTERVAL) {
     lastTelegramCheckTime = now;
     checkTelegramCommands();
@@ -651,12 +859,17 @@ void updateTrafficLight() {
 
   float pm25 = lastStatsPm25.median;
 
-  if (pm25 <= 12.0f) {
-    setLedColor(false, true, false);  // Зеленый (Отлично)
-  } else if (pm25 <= 35.0f) {
-    setLedColor(true, true, false);   // Желтый (R + G = Смешиваются в желтый)
+  if (pm25 > 150.0f) {
+    pmsCriticalBlink = true;          // Мигающий красный (Опасно)
   } else {
-    setLedColor(true, false, false);  // Красный (Плохо / Вредно)
+    pmsCriticalBlink = false;
+    if (pm25 <= 12.0f) {
+      setLedColor(false, true, false);  // Зеленый (Отлично)
+    } else if (pm25 <= 35.0f) {
+      setLedColor(false, false, true);  // Желтый — LED_Y
+    } else {
+      setLedColor(true, false, false);  // Красный (Плохо / Вредно)
+    }
   }
 }
 
@@ -711,8 +924,10 @@ String pmsStatsJson(const char* prefix, PmsStats &s) {
 void sendDataToSupabase(float t, float h, float p) {
   if (WiFi.status() != WL_CONNECTED) return;
 
+  esp_task_wdt_reset();
   HTTPClient http;
   http.begin(SUPABASE_URL);
+  setupHttpClient(http);
   http.addHeader("apikey",        SUPABASE_KEY);
   http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
   http.addHeader("Content-Type",  "application/json");
@@ -740,6 +955,7 @@ void sendDataToSupabase(float t, float h, float p) {
                 hasPmsStats ? lastStatsPm25.median : 0.0f,
                 hasPmsStats ? lastStatsPm25.count  : 0);
   int code = http.POST(json);
+  esp_task_wdt_reset();
   http.end();
 
   if (code >= 200 && code < 300) {
@@ -752,6 +968,7 @@ void sendDataToSupabase(float t, float h, float p) {
     }
     supabaseErrorCount = 0;
     eventLog.add("Supabase OK");
+    if (ntpSynced) updateTimeStr(lastCloudSendTimeStr, sizeof(lastCloudSendTimeStr));
   } else {
     supabaseErrorCount++;
     supabaseTotalErrors++;
@@ -761,7 +978,7 @@ void sendDataToSupabase(float t, float h, float p) {
                   t, h, p, hasPmsStats ? lastStatsPm25.median : 0.0f);
     char buf[LOG_ENTRY_LEN];
     snprintf(buf, sizeof(buf), "Supabase FAIL HTTP %d T:%.1f", code, t);
-    errorLog.add(buf);
+    logError(buf);
 
     if (supabaseErrorCount >= SUPABASE_MAX_ERRORS) {
       String alert = "🚨 *БАЛКОН — SUPABASE НЕ ОТВЕЧАЕТ*\n";
@@ -781,11 +998,129 @@ void sendDataToSupabase(float t, float h, float p) {
 }
 
 // ============================================================
+// Веб-статус (http://<ip>/)
+// ============================================================
+String htmlRow(const char* label, const String& value, const char* valueClass = "") {
+  String row = "<tr><td class=\"k\">";
+  row += label;
+  row += "</td><td";
+  if (valueClass[0] != '\0') {
+    row += " class=\"";
+    row += valueClass;
+    row += "\"";
+  }
+  row += ">";
+  row += value;
+  row += "</td></tr>";
+  return row;
+}
+
+void handleStatusPage() {
+  String html;
+  html.reserve(4096);
+
+  html += F("<!DOCTYPE html><html lang=\"ru\"><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            "<meta http-equiv=\"refresh\" content=\"10\">"
+            "<title>");
+  html += DEVICE_HOSTNAME;
+  html += F("</title><style>"
+            "body{font-family:system-ui,sans-serif;background:#0a0c12;color:#e8eaef;margin:0;padding:16px}"
+            "h1{font-size:1.25rem;margin:0 0 4px}p.sub{color:#96a0b4;font-size:.85rem;margin:0 0 16px}"
+            "section{background:#161a26;border-radius:10px;padding:12px 14px;margin-bottom:12px}"
+            "h2{font-size:.75rem;text-transform:uppercase;letter-spacing:.06em;color:#7b8499;margin:0 0 10px}"
+            "table{width:100%;border-collapse:collapse}td{padding:5px 0;border-bottom:1px solid #222836;font-size:.9rem}"
+            "td.k{color:#96a0b4;width:44%}.ok{color:#3ecf8e}.bad{color:#ff5c6c}.warn{color:#ffb020}"
+            "</style></head><body><h1>");
+  html += DEVICE_HOSTNAME;
+  html += F("</h1><p class=\"sub\">Балконная метеостанция · автообновление 10 с</p>");
+
+  html += F("<section><h2>Сеть</h2><table>");
+  bool wifiOk = WiFi.status() == WL_CONNECTED;
+  html += htmlRow("Wi-Fi", wifiOk ? "Подключено" : "Нет связи", wifiOk ? "ok" : "bad");
+  if (wifiOk) {
+    html += htmlRow("IP", WiFi.localIP().toString());
+    html += htmlRow("Hostname", WiFi.getHostname());
+    html += htmlRow("RSSI", String(WiFi.RSSI()) + " dBm");
+    html += htmlRow("SSID", WiFi.SSID());
+  }
+  html += htmlRow("Uptime", formatUptime(millis()));
+  if (ntpSynced) {
+    html += htmlRow("Время загрузки", bootTimeStr);
+  }
+  html += htmlRow("MQTT", mqttClient.connected() ? "Подключено" : "Нет связи",
+                  mqttClient.connected() ? "ok" : "bad");
+  html += F("</table></section>");
+
+  html += F("<section><h2>Климат (BME280)</h2><table>");
+  html += htmlRow("Датчик", bmeReady ? "OK" : "Ошибка", bmeReady ? "ok" : "bad");
+  if (hasClimateReading) {
+    html += htmlRow("Температура", String(lastClimateTemp, 1) + " °C");
+    html += htmlRow("Влажность", String(lastClimateHum, 0) + " %");
+    html += htmlRow("Давление", String(lastClimatePres, 1) + " mmHg");
+    html += htmlRow("Последний замер", lastClimateTimeStr);
+  } else {
+    html += htmlRow("Показания", "Нет данных", "warn");
+  }
+  html += htmlRow("Stale BME", String(staleBmeCount) + "/" + String(STALE_BME_THRESHOLD));
+  html += F("</table></section>");
+
+  html += F("<section><h2>Пыль (PMS5003)</h2><table>");
+  String pmsState = pmsSampling ? "Серия замеров" : (pmsIsAwake ? "Прогрев" : "Сон");
+  html += htmlRow("Состояние", pmsState);
+  if (hasPmsStats) {
+    html += htmlRow("PM1.0", String((int)lastStatsPm1.median) + " мкг/м³");
+    html += htmlRow("PM2.5", String((int)lastStatsPm25.median) + " мкг/м³");
+    html += htmlRow("PM10", String((int)lastStatsPm10.median) + " мкг/м³");
+    html += htmlRow("Выборка", "n=" + String(lastStatsPm25.count));
+    html += htmlRow("Последний цикл", lastPmsTimeStr);
+  } else {
+    html += htmlRow("Показания", "Нет данных", "warn");
+  }
+  if (pmsErrorCount > 0) {
+    html += htmlRow("Ошибки подряд", String(pmsErrorCount), "bad");
+  }
+  html += htmlRow("Stale PMS", String(stalePmsCount) + "/" + String(STALE_PMS_THRESHOLD));
+  html += F("</table></section>");
+
+  html += F("<section><h2>Облако</h2><table>");
+  html += htmlRow("Последняя отправка", lastCloudSendTimeStr);
+  html += htmlRow("Ошибок Supabase", String(supabaseTotalErrors),
+                  supabaseTotalErrors == 0 ? "ok" : "bad");
+  html += F("</table></section>");
+
+  html += F("<section><h2>Система</h2><table>");
+  html += htmlRow("CPU", String(temperatureRead(), 1) + " °C");
+  html += htmlRow("Heap", String(ESP.getFreeHeap()) + " B (min " + String(sessionMinHeap) + ")");
+  html += htmlRow("Причина ребута", rebootReasonShort);
+  html += F("</table></section></body></html>");
+
+  statusServer.send(200, "text/html; charset=utf-8", html);
+}
+
+void startWebServer() {
+  if (webServerStarted) return;
+  statusServer.on("/", handleStatusPage);
+  statusServer.begin();
+  webServerStarted = true;
+  Serial.printf("[Web] http://%s/ (%s.local)\n",
+                WiFi.localIP().toString().c_str(), DEVICE_HOSTNAME);
+}
+
+void ensureWebServer() {
+  if (WiFi.status() == WL_CONNECTED && !webServerStarted) {
+    startWebServer();
+  }
+}
+
+// ============================================================
 // Wi-Fi
 // ============================================================
 void connectToWiFi() {
   if (WiFi.status() == WL_CONNECTED) return;
   Serial.print("Wi-Fi... ");
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname(DEVICE_HOSTNAME);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   int att = 0;
   // Неблокирующее ожидание внутри функции, чтобы WDT не сработал при долгом подключении
@@ -800,8 +1135,126 @@ void connectToWiFi() {
     eventLog.add("WiFi reconnect OK");
   } else {
     Serial.println(" FAIL");
-    errorLog.add("WiFi reconnect FAIL");
+    logError("WiFi reconnect FAIL");
   }
+}
+
+// ============================================================
+// MQTT (шлюз esp32.kuzyak.in)
+// ============================================================
+void initMqttTopics() {
+  if (mqttTopicsReady) return;
+
+  snprintf(topicStatus, sizeof(topicStatus), "devices/%s/status", DEVICE_HOSTNAME);
+  snprintf(topicTelemetry, sizeof(topicTelemetry), "devices/%s/telemetry", DEVICE_HOSTNAME);
+  snprintf(topicCommand, sizeof(topicCommand), "devices/%s/command", DEVICE_HOSTNAME);
+
+  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+  mqttClient.setCallback(handleMqttCommand);
+  mqttClient.setBufferSize(512);
+  mqttTopicsReady = true;
+}
+
+void setBoardLed(bool on) {
+  boardLedOn = on;
+  digitalWrite(LED_BUILTIN, on ? LOW : HIGH);
+}
+
+void showStatusScreen() {
+  oledStatusHold = true;
+  oledStatusHoldStart = millis();
+  updateOled(OLED_PAGE_HARDWARE);
+}
+
+void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, payload, length)) return;
+
+  const char* action = doc["action"];
+  if (!action) return;
+
+  if (strcmp(action, "led") == 0) {
+    if (!doc["value"].is<bool>()) return;
+    bool on = doc["value"];
+    Serial.printf("[MQTT] led %s\n", on ? "on" : "off");
+    setBoardLed(on);
+    return;
+  }
+
+  if (strcmp(action, "reboot") == 0) {
+    Serial.println("[MQTT] reboot");
+    delay(1000);
+    requestReboot(REBOOT_MQTT);
+    return;
+  }
+
+  if (strcmp(action, "status") == 0) {
+    Serial.println("[MQTT] status screen");
+    showStatusScreen();
+  }
+}
+
+void ensureMqtt() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  initMqttTopics();
+
+  if (mqttClient.connected()) return;
+
+  esp_task_wdt_reset();
+  if (mqttClient.connect(DEVICE_HOSTNAME, MQTT_USER, MQTT_PASS,
+                         topicStatus, 1, true, "{\"status\":\"offline\"}")) {
+    mqttClient.publish(topicStatus, "{\"status\":\"online\"}", true);
+    mqttClient.subscribe(topicCommand, 1);
+    Serial.println("[MQTT] connected");
+    eventLog.add("MQTT OK");
+  } else {
+    Serial.printf("[MQTT] connect failed, rc=%d\n", mqttClient.state());
+  }
+}
+
+void publishMqttTelemetry() {
+  if (!mqttClient.connected()) return;
+
+  esp_task_wdt_reset();
+
+  StaticJsonDocument<512> doc;
+  doc["uptime"] = millis() / 1000UL;
+  doc["rssi"] = WiFi.RSSI();
+  doc["heap"] = ESP.getFreeHeap();
+  doc["min_heap"] = sessionMinHeap;
+  doc["bme_ready"] = bmeReady;
+  doc["led"] = boardLedOn;
+  doc["oled_page"] = oledPage + 1;
+  doc["overlay"] = oledStatusHold ? "status" : "";
+  doc["pms_awake"] = pmsIsAwake;
+  doc["pms_sampling"] = pmsSampling;
+  doc["supabase_errors"] = supabaseTotalErrors;
+  doc["stale_bme"] = staleBmeCount;
+  doc["stale_pms"] = stalePmsCount;
+
+  if (hasClimateReading) {
+    doc["temperature"] = lastClimateTemp;
+    doc["humidity"] = lastClimateHum;
+    doc["pressure"] = lastClimatePres;
+  } else {
+    float t, h, p;
+    if (readClimate(t, h, p)) {
+      doc["temperature"] = t;
+      doc["humidity"] = h;
+      doc["pressure"] = p;
+    }
+  }
+
+  if (hasPmsStats) {
+    doc["pm1_median"] = (int)lastStatsPm1.median;
+    doc["pm25_median"] = (int)lastStatsPm25.median;
+    doc["pm10_median"] = (int)lastStatsPm10.median;
+  }
+
+  char buf[512];
+  size_t n = serializeJson(doc, buf);
+  mqttClient.publish(topicTelemetry, buf, n);
 }
 
 // ============================================================
@@ -812,12 +1265,14 @@ void sendTelegramMessage(String message) {
     Serial.println("[Telegram] Нет Wi-Fi.");
     return;
   }
+  esp_task_wdt_reset();
   message.replace("\\", "\\\\");
   message.replace("\"", "\\\"");
 
   HTTPClient http;
   String url = "https://api.telegram.org/bot" + String(TELEGRAM_TOKEN) + "/sendMessage";
   http.begin(url);
+  setupHttpClient(http);
   http.addHeader("Content-Type", "application/json");
 
   String payload = "{\"chat_id\":\"" + String(TELEGRAM_CHAT_ID) +
@@ -825,8 +1280,12 @@ void sendTelegramMessage(String message) {
                    "\",\"parse_mode\":\"Markdown\"}";
 
   int code = http.POST(payload);
+  esp_task_wdt_reset();
   if (code > 0) Serial.printf("[Telegram] %d\n", code);
-  else          Serial.printf("[Telegram] ERR: %s\n", http.errorToString(code).c_str());
+  else {
+    Serial.printf("[Telegram] ERR: %s\n", http.errorToString(code).c_str());
+    logError("Telegram HTTP timeout/fail");
+  }
   http.end();
 }
 
@@ -842,10 +1301,12 @@ void checkTelegramCommands() {
   // Первый вызов после загрузки: пропускаем старые сообщения,
   // чтобы старая команда /reboot не вызвала цикл перезагрузок
   if (!telegramOffsetInit) {
-    String url = "https://api.telegram.org/bot" + String(TELEGRAM_TOKEN)
+    String url = "https://api.telegram.org/bot" + String(TELEGRAM_CMD_TOKEN)
                + "/getUpdates?offset=-1&limit=1";
     http.begin(url);
+    setupHttpClient(http);
     int code = http.GET();
+    esp_task_wdt_reset();
     if (code == 200) {
       String payload = http.getString();
       int idx = payload.indexOf("\"update_id\":");
@@ -859,11 +1320,13 @@ void checkTelegramCommands() {
     return;
   }
 
-  String url = "https://api.telegram.org/bot" + String(TELEGRAM_TOKEN)
+  String url = "https://api.telegram.org/bot" + String(TELEGRAM_CMD_TOKEN)
              + "/getUpdates?offset=" + String(telegramUpdateId)
              + "&limit=5&timeout=1";
   http.begin(url);
+  setupHttpClient(http);
   int code = http.GET();
+  esp_task_wdt_reset();
 
   if (code != 200) {
     http.end();
@@ -892,7 +1355,7 @@ void checkTelegramCommands() {
     msg += "━━━━━━━━━━━━━━━━━━━━━";
     sendTelegramMessage(msg);
     delay(1000);
-    esp_restart();
+    requestReboot(REBOOT_TELEGRAM);
   }
 
   if (payload.indexOf("/balcony_status") >= 0) {
@@ -904,7 +1367,7 @@ void checkTelegramCommands() {
     msg += "⏱ Uptime: `" + String(upMin / 60) + "ч " + String(upMin % 60) + "м`\n";
     msg += "📶 RSSI: `" + String(WiFi.RSSI()) + " dBm`\n";
     msg += "🌐 IP: `" + WiFi.localIP().toString() + "`\n";
-    msg += "🧠 Heap: `" + String(ESP.getFreeHeap()) + " bytes`\n\n";
+    msg += "🧠 Heap: `" + String(ESP.getFreeHeap()) + " bytes` (min: `" + String(sessionMinHeap) + "`)\n\n";
 
     msg += "📡 *Датчики*\n";
     msg += "  " + String(bmeReady ? "✅" : "❌") + " BME280 — stale `" + String(staleBmeCount) + "/" + String(STALE_BME_THRESHOLD) + "`\n";
@@ -940,123 +1403,397 @@ void checkTelegramCommands() {
     Serial.println("[Telegram] Получена команда /balcony_errors");
     String msg = "🚨 *БАЛКОН — Лог ошибок*\n";
     msg += "━━━━━━━━━━━━━━━━━━━━━\n\n";
+    msg += "*Текущая сессия:*\n";
     msg += errorLog.format();
+    msg += "\n*Сохранено в RTC (переживает ребут):*\n";
+    msg += formatRtcErrorLog();
     msg += "\n━━━━━━━━━━━━━━━━━━━━━";
     sendTelegramMessage(msg);
   }
 }
 
 // ============================================================
-// LCD 1602A — статус системы (16x2, страницы)
+// NTP — форматирование времени
 // ============================================================
-void updateLcd(uint8_t page) {
-  lcd.clear();
-  unsigned long now = millis();
+void updateTimeStr(char* buf, size_t len) {
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo, 0)) {
+    strftime(buf, len, "%d.%m %H:%M", &timeinfo);
+  }
+}
 
-  if (pmsErrorCount > 0 || !bmeReady) {
-    // ═══ Аварийная страница ═══
-    lcd.setCursor(0, 0);
-    lcd.print(F("*** ALERT ***"));
-    lcd.setCursor(0, 1);
-    if (!bmeReady)      lcd.print(F("BME280 FAIL"));
-    else {
-      lcd.print(F("PMS ERR x"));
-      lcd.print(pmsErrorCount);
-    }
+void formatClockShort(char* buf, size_t len) {
+  struct tm timeinfo;
+  if (ntpSynced && getLocalTime(&timeinfo, 0)) {
+    strftime(buf, len, "%H:%M", &timeinfo);
+  } else {
+    snprintf(buf, len, "--:--");
+  }
+}
+
+void formatNextWallTime(unsigned long targetMs, unsigned long nowMs, char* buf, size_t len) {
+  if (!ntpSynced) {
+    snprintf(buf, len, "---");
     return;
   }
 
-  // Текущее название цвета LED
-  const char* ledName;
-  if (!hasPmsStats)      ledName = "YELLOW";
-  else {
-    float pm25 = lastStatsPm25.median;
-    if (pm25 <= 12.0f)      ledName = "GREEN";
-    else if (pm25 <= 35.0f) ledName = "YELLOW";
-    else                    ledName = "RED";
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo, 0)) {
+    snprintf(buf, len, "---");
+    return;
+  }
+
+  time_t nowEpoch = mktime(&timeinfo);
+  long deltaSec = (long)((targetMs > nowMs) ? (targetMs - nowMs) / 1000UL : 0);
+  time_t nextEpoch = nowEpoch + deltaSec;
+  struct tm nextTm;
+  localtime_r(&nextEpoch, &nextTm);
+  strftime(buf, len, "%H:%M", &nextTm);
+}
+
+void formatCountdown(unsigned long targetMs, unsigned long nowMs, char* buf, size_t len) {
+  if (targetMs <= nowMs) {
+    snprintf(buf, len, "now");
+    return;
+  }
+
+  unsigned long sec = (targetMs - nowMs) / 1000UL;
+  if (sec >= 3600UL) {
+    snprintf(buf, len, "%lum%02lus", sec / 60UL, sec % 60UL);
+  } else {
+    snprintf(buf, len, "%lum%02lus", sec / 60UL, sec % 60UL);
+  }
+}
+
+unsigned long nextPmsCompleteTime() {
+  if (pmsSampling) {
+    return pmsSamplingStartTime + PMS_SAMPLE_TIME;
+  }
+  return pmsWakeupTargetTime + PMS_WAKEUP_TIME + PMS_SAMPLE_TIME;
+}
+
+void oledDrawLine(int y) {
+  display.drawLine(0, y, 127, y, SSD1306_WHITE);
+}
+
+void oledDrawHeader(uint8_t page, const char* title) {
+  char clockBuf[6];
+  formatClockShort(clockBuf, sizeof(clockBuf));
+  display.setCursor(0, 0);
+  display.printf("[%d/%d] %-5s %s+4", page + 1, OLED_PAGE_COUNT, title, clockBuf);
+  oledDrawLine(10);
+}
+
+// ============================================================
+// OLED SSD1306 128x64 — статус системы (страницы)
+// ============================================================
+void updateOled(uint8_t page) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  unsigned long now = millis();
+
+  if (pmsErrorCount > 0 || !bmeReady) {
+    display.setTextSize(2);
+    display.setCursor(22, 4);
+    display.print(F("ALERT!"));
+    display.setTextSize(1);
+    display.drawLine(0, 24, 127, 24, SSD1306_WHITE);
+    display.setCursor(0, 30);
+    if (!bmeReady) {
+      display.print(F("BME280 FAIL"));
+    } else {
+      display.printf("PMS ERR x%d", pmsErrorCount);
+    }
+    display.setCursor(0, 46);
+    display.print(F("Check hardware!"));
+    display.display();
+    return;
   }
 
   switch (page) {
-    // ════════════════════════════════════════════
-    case LCD_PAGE_SYSTEM: {
-      lcd.setCursor(0, 0);
-      if (WiFi.status() == WL_CONNECTED) {
-        lcd.print(F("WiFi:OK "));
-        lcd.print(WiFi.RSSI());
-        lcd.print(F("dBm"));
+    case OLED_PAGE_CLIMATE: {
+      oledDrawHeader(page, "KLIMA");
+
+      display.setCursor(0, 14);
+      if (hasClimateReading) {
+        display.printf("T:%5.1fC  H:%3.0f%%", lastClimateTemp, lastClimateHum);
+        display.setCursor(0, 24);
+        display.printf("P:%6.1f mmHg", lastClimatePres);
       } else {
-        lcd.print(F("WiFi:DOWN    "));
+        display.print(F("No readings yet"));
       }
 
-      lcd.setCursor(0, 1);
-      lcd.print(F("BME:"));
-      lcd.print(bmeReady ? "OK " : "ERR");
-      lcd.print(F(" PMS:"));
-      if (pmsSampling)      lcd.print(F("SAMP"));
-      else if (pmsIsAwake)  lcd.print(F("WARM"));
-      else                  lcd.print(F("SLP "));
+      oledDrawLine(34);
+
+      display.setCursor(0, 38);
+      display.print(F("Last: "));
+      display.print(lastClimateTimeStr);
+
+      char nextTime[6];
+      char nextIn[12];
+      formatNextWallTime(lastClimateTickTime + CLIMATE_TICK_INTERVAL, now, nextTime, sizeof(nextTime));
+      formatCountdown(lastClimateTickTime + CLIMATE_TICK_INTERVAL, now, nextIn, sizeof(nextIn));
+      display.setCursor(0, 50);
+      display.printf("Next: %s (%s)", nextTime, nextIn);
       break;
     }
 
-    // ════════════════════════════════════════════
-    case LCD_PAGE_AQI: {
-      lcd.setCursor(0, 0);
-      lcd.print(F("PM2.5: "));
+    case OLED_PAGE_DUST: {
+      oledDrawHeader(page, "PYL");
+
+      display.setCursor(0, 14);
       if (hasPmsStats) {
-        lcd.print((int)lastStatsPm25.median);
-        lcd.print(F(" ug/m3"));
+        display.printf("PM2.5:%4.0f  PM10:%4.0f",
+                       lastStatsPm25.median, lastStatsPm10.median);
+        display.setCursor(0, 24);
+        display.printf("PM1:%5.0f  n=%d",
+                       lastStatsPm1.median, lastStatsPm25.count);
       } else {
-        lcd.print(F("--- ug/m3"));
+        display.print(F("No PMS data yet"));
       }
 
-      lcd.setCursor(0, 1);
-      lcd.print(F("LED: "));
-      lcd.print(ledName);
+      oledDrawLine(34);
+
+      display.setCursor(0, 38);
+      display.print(F("Last: "));
+      display.print(lastPmsTimeStr);
+
+      if (pmsSampling) {
+        display.setCursor(0, 50);
+        display.print(F("Next: SAMPLING..."));
+      } else if (pmsIsAwake) {
+        display.setCursor(0, 50);
+        display.print(F("Next: WARMUP..."));
+      } else {
+        char nextTime[6];
+        char nextIn[12];
+        unsigned long nextDone = nextPmsCompleteTime();
+        formatNextWallTime(nextDone, now, nextTime, sizeof(nextTime));
+        formatCountdown(nextDone, now, nextIn, sizeof(nextIn));
+        display.setCursor(0, 50);
+        display.printf("Next: %s (%s)", nextTime, nextIn);
+      }
       break;
     }
 
-    // ════════════════════════════════════════════
-    case LCD_PAGE_TIMER: {
-      lcd.setCursor(0, 0);
-      if (!pmsIsAwake && !pmsSampling) {
-        lcd.print(F("Next: "));
-        if (now < pmsWakeupTargetTime) {
-          unsigned long sec = (pmsWakeupTargetTime - now) / 1000UL;
-          if (sec >= 60) { lcd.print(sec / 60); lcd.print('m'); lcd.print(' '); }
-          lcd.print(sec % 60);
-          lcd.print('s');
-        } else {
-          lcd.print(F("NOW     "));
-        }
-      } else if (pmsSampling) {
-        lcd.print(F("> SAMPLING <"));
-      } else {
-        lcd.print(F("> WARMUP <"));
-      }
+    case OLED_PAGE_CLOUD: {
+      oledDrawHeader(page, "CLOUD");
 
-      lcd.setCursor(0, 1);
-      lcd.print(F("Up:"));
-      {
-        unsigned long up = millis() / 60000UL;
-        lcd.print(up / 60);
-        lcd.print('h');
-        lcd.print(up % 60);
-        lcd.print('m');
+      display.setCursor(0, 14);
+      display.print(F("Target: Supabase"));
+      display.setCursor(0, 24);
+      display.printf("Every %lum", CLIMATE_SEND_INTERVAL / 60000UL);
+
+      oledDrawLine(34);
+
+      display.setCursor(0, 38);
+      display.print(F("Last: "));
+      display.print(lastCloudSendTimeStr);
+
+      char nextTime[6];
+      char nextIn[12];
+      formatNextWallTime(lastClimateSendTime + CLIMATE_SEND_INTERVAL, now, nextTime, sizeof(nextTime));
+      formatCountdown(lastClimateSendTime + CLIMATE_SEND_INTERVAL, now, nextIn, sizeof(nextIn));
+      display.setCursor(0, 50);
+      display.printf("Next: %s (%s)", nextTime, nextIn);
+
+      if (supabaseTotalErrors > 0) {
+        display.setCursor(90, 14);
+        display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+        display.printf(" E:%d ", supabaseTotalErrors);
+        display.setTextColor(SSD1306_WHITE);
       }
-      lcd.print(F(" Buf:"));
-      lcd.print(climateBufferIndex);
-      lcd.print('/');
-      lcd.print(CLIMATE_BUFFER_SIZE);
       break;
     }
 
-    // ════════════════════════════════════════════
-    case LCD_PAGE_REBOOT: {
-      lcd.setCursor(0, 0);
-      lcd.print(F("Last reboot:"));
-      lcd.setCursor(0, 1);
-      lcd.print(rebootReasonShort);
+    case OLED_PAGE_HARDWARE: {
+      oledDrawHeader(page, "HW");
+
+      display.setCursor(0, 14);
+      display.print(F("BME280: "));
+      display.print(bmeReady ? F("OK") : F("FAIL"));
+
+      display.setCursor(0, 24);
+      display.print(F("PMS:    "));
+      if (pmsSampling) {
+        display.print(F("SAMPLING"));
+      } else if (pmsIsAwake) {
+        display.print(F("WARMUP"));
+      } else {
+        display.print(F("SLEEP"));
+      }
+
+      display.setCursor(0, 34);
+      display.print(F("WiFi:   "));
+      if (WiFi.status() == WL_CONNECTED) {
+        display.printf("OK %ddBm", WiFi.RSSI());
+      } else {
+        display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+        display.print(F(" DOWN "));
+        display.setTextColor(SSD1306_WHITE);
+      }
+
+      oledDrawLine(44);
+
+      display.setCursor(0, 48);
+      if (WiFi.status() == WL_CONNECTED) {
+        display.print(WiFi.localIP());
+      } else {
+        display.print(F("No network"));
+      }
+
+      display.setCursor(0, 58);
+      if (supabaseTotalErrors == 0 && bmeReady && pmsErrorCount == 0) {
+        display.print(F("ALL OK"));
+      } else {
+        display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+        display.printf(" ERR:%d ", supabaseTotalErrors + (bmeReady ? 0 : 1));
+        display.setTextColor(SSD1306_WHITE);
+      }
+      break;
+    }
+
+    case OLED_PAGE_SYSTEM: {
+      oledDrawHeader(page, "SYS");
+
+      display.setCursor(0, 14);
+      display.printf("CPU: %.1f C", temperatureRead());
+
+      unsigned long upMin = now / 60000UL;
+      display.setCursor(0, 24);
+      display.printf("Up:  %luh %02lum", upMin / 60, upMin % 60);
+
+      display.setCursor(0, 34);
+      display.printf("Heap: %lu  min:%lu",
+                     (unsigned long)ESP.getFreeHeap(),
+                     (unsigned long)sessionMinHeap);
+
+      oledDrawLine(44);
+
+      display.setCursor(0, 48);
+      display.print(F("Boot: "));
+      display.print(bootTimeStr);
+
+      display.setCursor(0, 58);
+      display.printf("Rst: %s", rebootReasonShort);
       break;
     }
   }
+
+  display.display();
+}
+
+// ============================================================
+// HTTP helpers
+// ============================================================
+void setupHttpClient(HTTPClient &http) {
+  http.setConnectTimeout(5000);
+  http.setTimeout(HTTP_TIMEOUT_MS);
+}
+
+// ============================================================
+// Диагностика ребутов и персистентный лог ошибок
+// ============================================================
+void rtcErrorPersist(const char* text, uint32_t uptimeMs) {
+  strncpy(rtcErrorEntries[rtcErrorHead], text, LOG_ENTRY_LEN - 1);
+  rtcErrorEntries[rtcErrorHead][LOG_ENTRY_LEN - 1] = '\0';
+  rtcErrorUptime[rtcErrorHead] = uptimeMs;
+  rtcErrorHead = (rtcErrorHead + 1) % RTC_ERROR_LOG_SIZE;
+  if (rtcErrorCount < RTC_ERROR_LOG_SIZE) rtcErrorCount++;
+}
+
+void logError(const char* text) {
+  errorLog.add(text);
+  rtcErrorPersist(text, millis());
+}
+
+String formatRtcErrorLog() {
+  if (rtcErrorCount == 0) return "  _пусто_\n";
+  String result = "";
+  int start = (rtcErrorHead - rtcErrorCount + RTC_ERROR_LOG_SIZE) % RTC_ERROR_LOG_SIZE;
+  for (int i = 0; i < rtcErrorCount; i++) {
+    int idx = (start + i) % RTC_ERROR_LOG_SIZE;
+    char timeBuf[16];
+    snprintf(timeBuf, sizeof(timeBuf), "uptime %luh%02lum",
+             rtcErrorUptime[idx] / 3600000UL,
+             (rtcErrorUptime[idx] / 60000UL) % 60UL);
+    result += "  `" + String(timeBuf) + "` " + String(rtcErrorEntries[idx]) + "\n";
+  }
+  return result;
+}
+
+String resetReasonLabel(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_UNKNOWN:   return "UNKNOWN";
+    case ESP_RST_POWERON:   return "POWER ON";
+    case ESP_RST_EXT:       return "EXT PIN";
+    case ESP_RST_SW:        return "SOFTWARE";
+    case ESP_RST_PANIC:     return "PANIC";
+    case ESP_RST_INT_WDT:   return "INT WDT";
+    case ESP_RST_TASK_WDT:  return "TASK WDT";
+    case ESP_RST_WDT:       return "WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEP SLEEP";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT";
+    case ESP_RST_SDIO:      return "SDIO";
+    default:                return "OTHER(" + String((int)reason) + ")";
+  }
+}
+
+String rebootCauseLabel(RebootCause cause) {
+  switch (cause) {
+    case REBOOT_WIFI_TIMEOUT: return "WiFi таймаут 10м";
+    case REBOOT_DAILY:        return "Суточный ребут";
+    case REBOOT_BME_STALE:    return "BME280 stale";
+    case REBOOT_PMS_STALE:    return "PMS5003 stale";
+    case REBOOT_TELEGRAM:     return "Telegram /balcony_esp_rst";
+    case REBOOT_MQTT:         return "MQTT reboot";
+    default:                  return "неизвестно";
+  }
+}
+
+String formatUptime(unsigned long ms) {
+  unsigned long sec = ms / 1000UL;
+  return String(sec / 3600UL) + "ч " + String((sec % 3600UL) / 60UL) + "м " + String(sec % 60UL) + "с";
+}
+
+String buildRebootDebugBlock(esp_reset_reason_t hwReason) {
+  String block = "🔍 *Диагностика:*\n";
+  block += "  HW reset: `" + resetReasonLabel(hwReason) + " (#" + String((int)hwReason) + ")`\n";
+
+  if (hwReason == ESP_RST_SW && rtcRebootMagic == REBOOT_RTC_MAGIC) {
+    block += "  SW reset: `" + rebootCauseLabel((RebootCause)rtcRebootCode) + "`\n";
+    block += "  Prev uptime: `" + formatUptime(rtcRebootUptime) + "`\n";
+    block += "  Prev heap: `" + String(rtcRebootHeap) + "` (min: `" + String(rtcRebootMinHeap) + "`)\n";
+    block += "  Prev stale PMS: `" + String(rtcRebootStalePms) + "/" + String(STALE_PMS_THRESHOLD) + "`\n";
+    block += "  Prev stale BME: `" + String(rtcRebootStaleBme) + "/" + String(STALE_BME_THRESHOLD) + "`\n";
+  } else if (hwReason != ESP_RST_POWERON && hwReason != ESP_RST_SW) {
+    block += "  ⚠️ Неплановый ребут — см. лог ошибок RTC\n";
+  }
+
+  block += "  Heap now: `" + String(ESP.getFreeHeap()) + "`\n";
+  block += "  Min heap (IDF): `" + String(esp_get_minimum_free_heap_size()) + "`\n\n";
+  return block;
+}
+
+void requestReboot(RebootCause cause) {
+  rtcRebootMagic    = REBOOT_RTC_MAGIC;
+  rtcRebootCode     = cause;
+  rtcRebootUptime   = millis();
+  rtcRebootHeap     = ESP.getFreeHeap();
+  rtcRebootMinHeap  = sessionMinHeap;
+  rtcRebootStalePms = stalePmsCount;
+  rtcRebootStaleBme = staleBmeCount;
+
+  char buf[LOG_ENTRY_LEN];
+  snprintf(buf, sizeof(buf), "REBOOT -> %s", rebootCauseLabel(cause).c_str());
+  logError(buf);
+
+  Serial.printf("[Reboot] Запрос: %s, uptime: %s, heap: %lu, minHeap: %lu\n",
+                rebootCauseLabel(cause).c_str(),
+                formatUptime(millis()).c_str(),
+                (unsigned long)rtcRebootHeap,
+                (unsigned long)rtcRebootMinHeap);
+  delay(300);
+  esp_restart();
 }
