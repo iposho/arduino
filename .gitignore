@@ -1,5 +1,6 @@
 # Arduino build output
 build/
+ota/
 *.elf
 *.bin
 *.hex

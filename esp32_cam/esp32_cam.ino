@@ -5,6 +5,7 @@
 #include <HTTPUpdate.h>
 #include <WebServer.h>
 #include <ArduinoJson.h>
+#include <LittleFS.h>
 #include <time.h>
 
 #include "esp_camera.h"
@@ -43,6 +44,10 @@ const unsigned long MQTT_TELEMETRY_INTERVAL = 10UL * 1000UL;
 const unsigned long WIFI_RETRY_INTERVAL     = 30UL * 1000UL;
 const unsigned long NTP_GMT_OFFSET_SEC      = 4UL * 3600UL;
 
+#define MQTT_BUFFER_SIZE  4096
+#define FS_READ_MAX_BYTES 2800
+#define FS_LS_MAX_ENTRIES 32
+
 const uint16_t MAX_PHOTOS = 4800;
 const char* PHOTOS_DIR = "/photos";
 
@@ -79,6 +84,12 @@ unsigned long lastWifiRetry = 0;
 char otaUrl[256] = "";
 bool otaPending = false;
 int lastOtaProgress = -1;
+bool littleFsReady = false;
+bool otaInProgress = false;
+char otaPhase[24] = "";
+int otaProgressPct = -1;
+size_t otaBytesDone = 0;
+size_t otaBytesTotal = 0;
 
 // =====================
 // Forward declarations
@@ -95,8 +106,16 @@ void initMqttTopics();
 void ensureMqtt();
 void publishMqttTelemetry();
 void publishOtaEvent(const char* phase, int progress = -1);
+void setOtaProgress(const char* phase, int progress, size_t current = 0, size_t total = 0);
 void queueOtaUpdate(const char* url);
 void performOtaUpdate(const char* url);
+bool isFsPathValid(const char* path);
+void publishFsTelemetry(JsonDocument& doc);
+void publishFsError(const char* action, const char* path, const char* error);
+void handleFsLs(const char* path);
+void handleFsRead(const char* path);
+void handleFsWrite(const char* path, const char* content);
+void handleFsRm(const char* path);
 void handleMqttCommand(char* topic, byte* payload, unsigned int length);
 void startWebServer();
 void ensureWebServer();
@@ -385,16 +404,212 @@ void initMqttTopics() {
 
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
   mqttClient.setCallback(handleMqttCommand);
-  mqttClient.setBufferSize(512);
+  mqttClient.setBufferSize(MQTT_BUFFER_SIZE);
   mqttTopicsReady = true;
 }
 
+bool isFsPathValid(const char* path) {
+  if (!path || path[0] != '/') return false;
+  if (strstr(path, "..") != nullptr) return false;
+  return strlen(path) < 128;
+}
+
+void publishFsTelemetry(JsonDocument& doc) {
+  if (!mqttClient.connected()) {
+    Serial.println("[FS] mqtt not connected, skip publish");
+    return;
+  }
+
+  char buf[MQTT_BUFFER_SIZE];
+  size_t n = serializeJson(doc, buf, sizeof(buf));
+  if (n == 0 || n >= sizeof(buf)) {
+    Serial.println("[FS] response too large for MQTT buffer");
+    publishFsError("fs", nullptr, "response too large");
+    return;
+  }
+  Serial.printf("[FS] >> %s (%u bytes)\n", topicTelemetry, n);
+  bool ok = mqttClient.publish(topicTelemetry, buf, n);
+  Serial.printf("[FS] publish %s\n", ok ? "OK" : "FAILED");
+  mqttClient.loop();
+}
+
+void publishFsError(const char* action, const char* path, const char* error) {
+  Serial.printf("[FS] error action=%s path=%s: %s\n",
+                action ? action : "-", path ? path : "-", error);
+  if (!mqttClient.connected()) return;
+
+  StaticJsonDocument<256> doc;
+  doc["fs_error"] = error;
+  doc["fs_action"] = action;
+  if (path) doc["fs_path"] = path;
+
+  char buf[256];
+  size_t n = serializeJson(doc, buf);
+  mqttClient.publish(topicTelemetry, buf, n);
+  mqttClient.loop();
+}
+
+void handleFsLs(const char* path) {
+  if (!littleFsReady) {
+    publishFsError("fs_ls", path, "filesystem not mounted");
+    return;
+  }
+  if (!isFsPathValid(path)) {
+    publishFsError("fs_ls", path, "invalid path");
+    return;
+  }
+
+  File dir = LittleFS.open(path);
+  if (!dir || !dir.isDirectory()) {
+    publishFsError("fs_ls", path, dir ? "not a directory" : "open failed");
+    if (dir) dir.close();
+    return;
+  }
+
+  DynamicJsonDocument doc(4096);
+  JsonArray arr = doc.createNestedArray("fs_ls");
+  int count = 0;
+
+  for (File entry = dir.openNextFile(); entry && count < FS_LS_MAX_ENTRIES; entry = dir.openNextFile()) {
+    char fullPath[128];
+    if (strcmp(path, "/") == 0) {
+      snprintf(fullPath, sizeof(fullPath), "/%s", entry.name());
+    } else {
+      snprintf(fullPath, sizeof(fullPath), "%s/%s", path, entry.name());
+    }
+
+    JsonObject item = arr.createNestedObject();
+    item["name"] = fullPath;
+    item["size"] = entry.size();
+    Serial.printf("[FS]   %s (%u)\n", fullPath, entry.size());
+    entry.close();
+    count++;
+  }
+  dir.close();
+
+  if (count >= FS_LS_MAX_ENTRIES) {
+    doc["fs_ls_truncated"] = true;
+  }
+
+  Serial.printf("[FS] ls %s -> %d entries\n", path, count);
+  publishFsTelemetry(doc);
+}
+
+void handleFsRead(const char* path) {
+  if (!littleFsReady) {
+    publishFsError("fs_read", path, "filesystem not mounted");
+    return;
+  }
+  if (!isFsPathValid(path)) {
+    publishFsError("fs_read", path, "invalid path");
+    return;
+  }
+
+  if (!LittleFS.exists(path)) {
+    publishFsError("fs_read", path, "not found");
+    return;
+  }
+
+  File f = LittleFS.open(path, "r");
+  if (!f) {
+    publishFsError("fs_read", path, "open failed");
+    return;
+  }
+  if (f.isDirectory()) {
+    f.close();
+    publishFsError("fs_read", path, "is a directory");
+    return;
+  }
+
+  size_t fileSize = f.size();
+  if (fileSize > FS_READ_MAX_BYTES) {
+    f.close();
+    publishFsError("fs_read", path, "file too large");
+    return;
+  }
+
+  String content;
+  content.reserve(fileSize + 1);
+  while (f.available()) {
+    content += static_cast<char>(f.read());
+  }
+  f.close();
+
+  DynamicJsonDocument doc(fileSize + 192);
+  doc["fs_file"] = path;
+  doc["content"] = content;
+  Serial.printf("[FS] read %s (%u bytes)\n", path, fileSize);
+  publishFsTelemetry(doc);
+}
+
+void handleFsWrite(const char* path, const char* content) {
+  if (!littleFsReady) {
+    publishFsError("fs_write", path, "filesystem not mounted");
+    return;
+  }
+  if (!isFsPathValid(path)) {
+    publishFsError("fs_write", path, "invalid path");
+    return;
+  }
+  if (!content) content = "";
+
+  File f = LittleFS.open(path, "w");
+  if (!f) {
+    publishFsError("fs_write", path, "open failed");
+    return;
+  }
+
+  size_t written = f.print(content);
+  f.close();
+
+  StaticJsonDocument<192> doc;
+  doc["fs_written"] = path;
+  doc["bytes"] = written;
+  Serial.printf("[FS] write %s (%u bytes)\n", path, written);
+  publishFsTelemetry(doc);
+}
+
+void handleFsRm(const char* path) {
+  if (!littleFsReady) {
+    publishFsError("fs_rm", path, "filesystem not mounted");
+    return;
+  }
+  if (!isFsPathValid(path)) {
+    publishFsError("fs_rm", path, "invalid path");
+    return;
+  }
+
+  if (!LittleFS.exists(path)) {
+    publishFsError("fs_rm", path, "not found");
+    return;
+  }
+
+  if (!LittleFS.remove(path)) {
+    publishFsError("fs_rm", path, "remove failed");
+    return;
+  }
+
+  StaticJsonDocument<128> doc;
+  doc["fs_removed"] = path;
+  Serial.printf("[FS] rm %s\n", path);
+  publishFsTelemetry(doc);
+}
+
 void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
-  StaticJsonDocument<384> doc;
-  if (deserializeJson(doc, payload, length)) return;
+  Serial.printf("[MQTT] << %s (%u): %.*s\n", topic, length, length, payload);
+
+  DynamicJsonDocument doc(length + 64);
+  if (deserializeJson(doc, payload, length)) {
+    Serial.println("[MQTT] JSON parse error");
+    return;
+  }
 
   const char* action = doc["action"];
-  if (!action) return;
+  if (!action) {
+    Serial.println("[MQTT] no action field");
+    return;
+  }
+  Serial.printf("[MQTT] action=%s\n", action);
 
   if (strcmp(action, "led") == 0) {
     if (!doc["value"].is<bool>()) return;
@@ -428,6 +643,36 @@ void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
     queueOtaUpdate(url);
     return;
   }
+
+  if (strcmp(action, "fs_ls") == 0) {
+    const char* path = doc["path"] | "/";
+    handleFsLs(path);
+    return;
+  }
+
+  if (strcmp(action, "fs_read") == 0) {
+    const char* path = doc["path"];
+    if (!path || path[0] == '\0') return;
+    handleFsRead(path);
+    return;
+  }
+
+  if (strcmp(action, "fs_write") == 0) {
+    const char* path = doc["path"];
+    const char* content = doc["content"];
+    if (!path || path[0] == '\0') return;
+    handleFsWrite(path, content);
+    return;
+  }
+
+  if (strcmp(action, "fs_rm") == 0) {
+    const char* path = doc["path"];
+    if (!path || path[0] == '\0') return;
+    handleFsRm(path);
+    return;
+  }
+
+  Serial.printf("[MQTT] unknown action: %s\n", action);
 }
 
 void ensureMqtt() {
@@ -442,6 +687,8 @@ void ensureMqtt() {
     mqttClient.publish(topicStatus, "{\"status\":\"online\"}", true);
     mqttClient.subscribe(topicCommand, 1);
     Serial.println("[MQTT] connected");
+    Serial.printf("[MQTT] command  <- %s\n", topicCommand);
+    Serial.printf("[MQTT] telemetry -> %s\n", topicTelemetry);
     setStatus("MQTT connected");
   } else {
     Serial.printf("[MQTT] connect failed, rc=%d\n", mqttClient.state());
@@ -483,13 +730,42 @@ void publishMqttTelemetry() {
 void publishOtaEvent(const char* phase, int progress) {
   if (!mqttClient.connected()) return;
 
-  StaticJsonDocument<192> doc;
+  StaticJsonDocument<256> doc;
   doc["ota"] = phase;
   if (progress >= 0) doc["progress"] = progress;
+  if (otaBytesTotal > 0) {
+    doc["ota_bytes"] = otaBytesDone;
+    doc["ota_total"] = otaBytesTotal;
+  }
 
-  char buf[192];
+  char buf[256];
   size_t n = serializeJson(doc, buf);
   mqttClient.publish(topicTelemetry, buf, n);
+  mqttClient.loop();
+}
+
+void setOtaProgress(const char* phase, int progress, size_t current, size_t total) {
+  otaInProgress = true;
+  strncpy(otaPhase, phase ? phase : "", sizeof(otaPhase) - 1);
+  otaPhase[sizeof(otaPhase) - 1] = '\0';
+  otaProgressPct = progress;
+  otaBytesDone = current;
+  otaBytesTotal = total;
+
+  char status[64];
+  if (progress >= 0 && total > 0) {
+    snprintf(status, sizeof(status), "OTA %s %d%% (%u/%u KB)",
+             otaPhase, progress, (unsigned)(current / 1024), (unsigned)(total / 1024));
+  } else if (progress >= 0) {
+    snprintf(status, sizeof(status), "OTA %s %d%%", otaPhase, progress);
+  } else {
+    snprintf(status, sizeof(status), "OTA %s", otaPhase);
+  }
+  setStatus(status);
+
+  if (webServerStarted) {
+    statusServer.handleClient();
+  }
   mqttClient.loop();
 }
 
@@ -500,56 +776,67 @@ void queueOtaUpdate(const char* url) {
 }
 
 void performOtaUpdate(const char* url) {
-  Serial.printf("[OTA] starting: %s\n", url);
-  setStatus("OTA starting");
+  Serial.printf("[OTA] starting: %s (heap=%u)\n", url, ESP.getFreeHeap());
+  ensureWebServer();
+  setOtaProgress("starting", 0, 0, 0);
   publishOtaEvent("starting", 0);
-  lastOtaProgress = 0;
+  lastOtaProgress = -1;
+
+  if (mqttClient.connected()) {
+    mqttClient.disconnect();
+    delay(200);
+  }
+  WiFi.setSleep(WIFI_PS_NONE);
+  Serial.printf("[OTA] heap after cleanup: %u\n", ESP.getFreeHeap());
 
   httpUpdate.rebootOnUpdate(true);
   httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
 
   httpUpdate.onStart([]() {
     Serial.println("[OTA] start");
+    lastOtaProgress = -1;
+    setOtaProgress("downloading", 0, 0, 0);
     publishOtaEvent("downloading", 0);
-    lastOtaProgress = 0;
-    setStatus("OTA downloading");
   });
 
   httpUpdate.onProgress([](size_t current, size_t total) {
     int pct = (total > 0) ? (int)((current * 100UL) / total) : 0;
-    Serial.printf("[OTA] %d%%\n", pct);
-    if (pct >= lastOtaProgress + 10 || pct == 100) {
+    if (pct >= lastOtaProgress + 5 || pct == 100 || lastOtaProgress < 0) {
       lastOtaProgress = pct;
+      Serial.printf("[OTA] %d%% (%u/%u)\n", pct, (unsigned)current, (unsigned)total);
+      setOtaProgress("downloading", pct, current, total);
       publishOtaEvent("downloading", pct);
-      setStatus("OTA downloading");
     }
   });
 
   httpUpdate.onEnd([]() {
     Serial.println("[OTA] complete");
+    setOtaProgress("rebooting", 100, otaBytesTotal, otaBytesTotal);
     publishOtaEvent("rebooting", 100);
-    setStatus("OTA rebooting");
   });
 
   httpUpdate.onError([](int error) {
     Serial.printf("[OTA] error %d: %s\n", error, httpUpdate.getLastErrorString().c_str());
+    setOtaProgress("failed", -1, otaBytesDone, otaBytesTotal);
     publishOtaEvent("failed", -1);
-    setStatus("OTA failed");
   });
 
   t_httpUpdate_return ret;
   if (strncmp(url, "https://", 8) == 0) {
     WiFiClientSecure secureClient;
     secureClient.setInsecure();
+    secureClient.setTimeout(30000);
     ret = httpUpdate.update(secureClient, url);
   } else {
     WiFiClient client;
+    client.setTimeout(30000);
     ret = httpUpdate.update(client, url);
   }
 
   if (ret != HTTP_UPDATE_OK) {
     Serial.printf("[OTA] failed: %s\n", httpUpdate.getLastErrorString().c_str());
-    setStatus("OTA failed");
+    setOtaProgress("failed", -1, otaBytesDone, otaBytesTotal);
+    publishOtaEvent("failed", -1);
   }
 }
 
@@ -610,12 +897,16 @@ void handlePhotoById() {
 
 void handleStatusPage() {
   String html;
-  html.reserve(4096);
+  html.reserve(5120);
 
   html += F("<!DOCTYPE html><html lang=\"ru\"><head><meta charset=\"utf-8\">"
-            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-            "<meta http-equiv=\"refresh\" content=\"10\">"
-            "<title>");
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
+  if (otaInProgress) {
+    html += F("<meta http-equiv=\"refresh\" content=\"2\">");
+  } else {
+    html += F("<meta http-equiv=\"refresh\" content=\"10\">");
+  }
+  html += F("<title>");
   html += DEVICE_HOSTNAME;
   html += F("</title><style>"
             "body{font-family:system-ui,sans-serif;background:#0a0c12;color:#e8eaef;margin:0;padding:16px}"
@@ -625,9 +916,46 @@ void handleStatusPage() {
             "table{width:100%;border-collapse:collapse}td{padding:5px 0;border-bottom:1px solid #222836;font-size:.9rem}"
             "td.k{color:#96a0b4;width:44%}.ok{color:#3ecf8e}.bad{color:#ff5c6c}.warn{color:#ffb020}"
             "img.preview{width:100%;max-width:800px;border-radius:8px;background:#000}"
+            ".ota-bar{height:12px;background:#222836;border-radius:6px;overflow:hidden}"
+            ".ota-fill{height:100%;background:linear-gradient(90deg,#2864ff,#3ecf8e);border-radius:6px}"
+            ".ota-label{font-size:.85rem;color:#c8d0e0;margin:8px 0 0}"
+            ".ota-pct{font-size:1.5rem;font-weight:600;margin:4px 0 8px}"
             "</style></head><body><h1>");
   html += DEVICE_HOSTNAME;
-  html += F("</h1><p class=\"sub\">ESP32-CAM · автообновление 10 с</p>");
+  if (otaInProgress) {
+    html += F("</h1><p class=\"sub\">ESP32-CAM · OTA обновление · автообновление 2 с</p>");
+  } else {
+    html += F("</h1><p class=\"sub\">ESP32-CAM · автообновление 10 с</p>");
+  }
+
+  if (otaInProgress) {
+    int pct = (otaProgressPct >= 0) ? otaProgressPct : 0;
+    const char* phaseClass = (strcmp(otaPhase, "failed") == 0) ? "bad" :
+                             (strcmp(otaPhase, "rebooting") == 0) ? "ok" : "warn";
+
+    html += F("<section><h2>OTA обновление</h2>");
+    html += F("<p class=\"ota-pct ");
+    html += phaseClass;
+    html += F("\">");
+    if (otaProgressPct >= 0) {
+      html += String(otaProgressPct);
+      html += '%';
+    } else {
+      html += otaPhase;
+    }
+    html += F("</p><div class=\"ota-bar\"><div class=\"ota-fill\" style=\"width:");
+    html += String(pct);
+    html += F("%\"></div></div><p class=\"ota-label\">");
+    html += otaPhase;
+    if (otaBytesTotal > 0) {
+      html += " · ";
+      html += String(otaBytesDone / 1024);
+      html += " / ";
+      html += String(otaBytesTotal / 1024);
+      html += " KB";
+    }
+    html += F("</p></section>");
+  }
 
   html += F("<section><h2>Последний кадр</h2>");
   if (lastPhotoPath[0] != '\0') {
@@ -710,6 +1038,18 @@ void setup() {
 
   pinMode(LED_FLASH_PIN, OUTPUT);
   setFlashLed(false);
+
+  littleFsReady = LittleFS.begin(true, "/littlefs", 10, "spiffs");
+  if (!littleFsReady) {
+    littleFsReady = LittleFS.begin(true);
+  }
+  if (!littleFsReady) {
+    Serial.println("[LittleFS] mount FAILED");
+    setStatus("FS error");
+  } else {
+    Serial.printf("[LittleFS] mounted, used=%u total=%u\n",
+                  LittleFS.usedBytes(), LittleFS.totalBytes());
+  }
 
   setStatus("Init camera");
   if (!initCamera()) {

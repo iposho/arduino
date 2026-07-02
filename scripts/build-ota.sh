@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# Сборка OTA-бинарников (.ino.bin) для всех ESP32-проектов.
+# Использование:
+#   ./scripts/build-ota.sh           — все проекты
+#   ./scripts/build-ota.sh flat      — только esp32_flat_bme280
+#   ./scripts/build-ota.sh balcony cam
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OTA_DIR="$ROOT/ota"
+
+find_arduino_cli() {
+  if [[ -n "${ARDUINO_CLI:-}" && -x "$ARDUINO_CLI" ]]; then
+    echo "$ARDUINO_CLI"
+    return
+  fi
+  if command -v arduino-cli >/dev/null 2>&1; then
+    command -v arduino-cli
+    return
+  fi
+  local bundled="/Applications/Arduino IDE.app/Contents/Resources/app/lib/backend/resources/arduino-cli"
+  if [[ -x "$bundled" ]]; then
+    echo "$bundled"
+    return
+  fi
+  echo "arduino-cli не найден. Установите Arduino CLI или задайте ARDUINO_CLI." >&2
+  exit 1
+}
+
+ARDUINO_CLI="$(find_arduino_cli)"
+
+# id|sketch_dir|fqbn|build_subdir|ota_filename
+PROJECTS=(
+  "flat|esp32_flat_bme280|esp32:esp32:esp32:PartitionScheme=default|esp32.esp32.esp32|esp32-flat.bin"
+  "balcony|esp32_balcony_pms5003_bme280|esp32:esp32:esp32:PartitionScheme=default|esp32.esp32.esp32|esp32-balcony.bin"
+  "cam|esp32_cam|esp32:esp32:esp32cam:PartitionScheme=default|esp32.esp32.esp32cam|esp32-cam.bin"
+)
+
+should_build() {
+  local id="$1"
+  [[ $# -eq 0 ]] && return 0
+  local target
+  for target in "$@"; do
+    [[ "$target" == "$id" ]] && return 0
+  done
+  return 1
+}
+
+build_project() {
+  local id sketch_dir fqbn build_subdir ota_name
+  IFS='|' read -r id sketch_dir fqbn build_subdir ota_name <<<"$1"
+
+  local sketch="$ROOT/$sketch_dir"
+  local build_path="$sketch/build/$build_subdir"
+  local ino_name
+  ino_name="$(basename "$sketch_dir").ino"
+
+  if [[ ! -f "$sketch/secrets.h" ]]; then
+    echo "[$id] пропуск: нет $sketch/secrets.h (скопируйте secrets.example.h)" >&2
+    return 1
+  fi
+
+  echo "[$id] компиляция..."
+  "$ARDUINO_CLI" compile \
+    --fqbn "$fqbn" \
+    --build-path "$build_path" \
+    "$sketch"
+
+  local src_bin="$build_path/${ino_name}.bin"
+  if [[ ! -f "$src_bin" ]]; then
+    echo "[$id] ошибка: не найден $src_bin" >&2
+    return 1
+  fi
+
+  mkdir -p "$OTA_DIR"
+  cp "$src_bin" "$OTA_DIR/$ota_name"
+
+  local size sha
+  size="$(wc -c < "$OTA_DIR/$ota_name" | tr -d ' ')"
+  sha="$(shasum -a 256 "$OTA_DIR/$ota_name" | awk '{print $1}')"
+  echo "[$id] -> ota/$ota_name  (${size} bytes, sha256=${sha:0:12}...)"
+}
+
+main() {
+  local targets=("$@")
+  local failed=0
+  local built=0
+
+  echo "arduino-cli: $("$ARDUINO_CLI" version)"
+  echo "выходная папка: $OTA_DIR"
+  echo
+
+  local entry id
+  for entry in "${PROJECTS[@]}"; do
+    IFS='|' read -r id _ _ _ _ <<<"$entry"
+    if [[ ${#targets[@]} -gt 0 ]] && ! should_build "$id" "${targets[@]}"; then
+      continue
+    fi
+    if build_project "$entry"; then
+      built=$((built + 1))
+    else
+      failed=$((failed + 1))
+    fi
+    echo
+  done
+
+  if [[ $built -eq 0 ]]; then
+    echo "Ничего не собрано. Доступные цели: flat, balcony, cam" >&2
+    exit 1
+  fi
+
+  if [[ $failed -gt 0 ]]; then
+    echo "Готово с ошибками: $built успешно, $failed с ошибками." >&2
+    exit 1
+  fi
+
+  echo "Готово: $built бинарник(ов) в ota/"
+  ls -lh "$OTA_DIR"/*.bin 2>/dev/null || true
+}
+
+main "$@"

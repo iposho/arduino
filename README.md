@@ -101,6 +101,7 @@ ESP32 DevKit + BME280 + PMS5003 + OLED SSD1306 128×64 + RGB-светофор.
 | `led` + `value: bool` | Встроенный LED платы (GPIO 2) |
 | `reboot` | Перезагрузка |
 | `status` | Показать страницу HW на OLED |
+| `ota` + `url: string` | OTA-обновление прошивки по HTTP(S) |
 
 **Пины:**
 
@@ -116,7 +117,7 @@ ESP32 DevKit + BME280 + PMS5003 + OLED SSD1306 128×64 + RGB-светофор.
 | LED Y | 27 |
 | LED встроенный | 2 |
 
-**Плата:** ESP32 Dev Module.
+**Плата:** ESP32 Dev Module, Partition = **Default** (4MB with spiffs, OTA).
 
 ---
 
@@ -144,6 +145,7 @@ ESP32 DevKit + BME280 + 1.8" TFT ST7735 + джойстик.
 | `reboot` | Перезагрузка |
 | `status` | Показать экран System info |
 | `refresh` | Принудительно обновить данные с балкона |
+| `ota` + `url: string` | OTA-обновление прошивки по HTTP(S) |
 
 **Пины:**
 
@@ -160,7 +162,7 @@ ESP32 DevKit + BME280 + 1.8" TFT ST7735 + джойстик.
 | Joystick Y | 35 |
 | Joystick SW | 32 |
 
-**Плата:** ESP32 Dev Module.
+**Плата:** ESP32 Dev Module, Partition = **Default** (4MB with spiffs, OTA).
 
 ---
 
@@ -184,6 +186,7 @@ AI-Thinker ESP32-CAM + microSD.
 | `capture` | Внеочередной снимок |
 | `reboot` | Перезагрузка |
 | `led` + `value: bool` | Вспышка (GPIO 4) |
+| `ota` + `url: string` | OTA-обновление прошивки по HTTP(S) |
 
 **Пины (встроенные на плате):**
 
@@ -193,7 +196,7 @@ AI-Thinker ESP32-CAM + microSD.
 | microSD (1-bit) | CLK 14, CMD 15, D0 2 |
 | Вспышка | 4 |
 
-**Прошивка:** Board = **AI Thinker ESP32-CAM**, Partition = **Huge APP**. microSD — **FAT32**.
+**Прошивка:** Board = **AI Thinker ESP32-CAM**, Partition = **Default** (4MB with spiffs, OTA). microSD — **FAT32**.
 
 ## Настройка
 
@@ -225,9 +228,43 @@ AI-Thinker ESP32-CAM + microSD.
 
 ### 3. Прошивка
 
+**Через USB (Arduino IDE):**
+
 1. Откройте `.ino` в Arduino IDE
-2. Выберите плату (см. разделы проектов выше)
+2. Выберите плату и схему разделов (см. разделы проектов выше)
 3. Загрузите прошивку
+
+**OTA (по MQTT):**
+
+Все три устройства поддерживают удалённое обновление через HTTP(S). Команда на топик `devices/<hostname>/command`:
+
+```json
+{"action": "ota", "url": "https://example.com/ota/esp32-flat.bin"}
+```
+
+Устройство скачивает `.bin`, прошивает OTA-слот и перезагружается. Прогресс публикуется в телеметрии (`ota`: `starting` → `downloading` → `complete` / `failed`).
+
+> **Важно:** для OTA нужна схема разделов с двумя слотами приложения (`app0` + `app1`). Схема **Huge APP** OTA не поддерживает. Если устройство прошито через USB со схемой Huge APP — один раз перепрошейте по USB с **Default**, дальше обновления пойдут по OTA.
+
+### 4. Сборка OTA-бинарников
+
+Скрипт `scripts/build-ota.sh` собирает прошивки через `arduino-cli` (из PATH или из Arduino IDE) и кладёт готовые `.bin` в `ota/`:
+
+| Цель | Плата | Partition | Файл |
+|------|-------|-----------|------|
+| `flat` | ESP32 Dev Module | Default | `ota/esp32-flat.bin` |
+| `balcony` | ESP32 Dev Module | Default | `ota/esp32-balcony.bin` |
+| `cam` | AI Thinker ESP32-CAM | Default | `ota/esp32-cam.bin` |
+
+```bash
+./scripts/build-ota.sh              # все проекты
+./scripts/build-ota.sh flat         # только комнатный дисплей
+./scripts/build-ota.sh balcony cam  # балкон + камера
+```
+
+Требуется `secrets.h` в папке проекта. Для OTA нужен только файл приложения (`.ino.bin`), не полный образ flash.
+
+Переменная `ARDUINO_CLI` переопределяет путь к CLI, если он не в PATH и Arduino IDE установлена нестандартно.
 
 ## Структура репозитория
 
@@ -235,16 +272,22 @@ AI-Thinker ESP32-CAM + microSD.
 arduino/
 ├── assets/
 │   └── hero.png                    # Обложка README
+├── scripts/
+│   └── build-ota.sh                # Сборка OTA-бинарников
+├── ota/                            # Готовые .bin для OTA (.gitignore)
 ├── esp32_balcony_pms5003_bme280/   # Балконная метеостанция
 │   ├── esp32_balcony_pms5003_bme280.ino
+│   ├── build/                      # Артефакты компиляции (.gitignore)
 │   ├── secrets.h                   # (.gitignore)
 │   └── secrets.example.h
 ├── esp32_flat_bme280/              # Комнатный дисплей
 │   ├── esp32_flat_bme280.ino
+│   ├── build/                      # (.gitignore)
 │   ├── secrets.h                   # (.gitignore)
 │   └── secrets.example.h
 ├── esp32_cam/                      # ESP32-CAM, фото на SD
 │   ├── esp32_cam.ino
+│   ├── build/                      # (.gitignore)
 │   ├── secrets.h                   # (.gitignore)
 │   └── secrets.example.h
 ├── libraries/                      # Локальные библиотеки (.gitignore)
