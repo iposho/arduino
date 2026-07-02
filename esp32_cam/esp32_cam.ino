@@ -189,8 +189,8 @@ bool initCamera() {
     s->set_brightness(s, 0);
     s->set_contrast(s, 0);
     s->set_saturation(s, 0);
-    s->set_hmirror(s, 1);
-    s->set_vflip(s, 1);    // кадр не вверх ногами
+    s->set_hmirror(s, 0);
+    s->set_vflip(s, 1);
   }
 
   cameraReady = true;
