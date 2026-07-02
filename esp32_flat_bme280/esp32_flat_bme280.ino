@@ -1,8 +1,10 @@
 #include <Wire.h>
 #include <SPI.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <HTTPClient.h>
+#include <HTTPUpdate.h>
 #include <ArduinoJson.h>
 #include <time.h>
 
@@ -180,6 +182,10 @@ char topicCommand[64];
 bool mqttTopicsReady = false;
 unsigned long lastMqttTelemetry = 0;
 
+char otaUrl[256] = "";
+bool otaPending = false;
+int lastOtaProgress = -1;
+
 // =====================
 // Forward declarations
 // =====================
@@ -196,7 +202,14 @@ void setBoardLed(bool on);
 void showStatusScreen();
 void ensureMqtt();
 void publishMqttTelemetry();
+void publishOtaEvent(const char* phase, int progress = -1);
+void queueOtaUpdate(const char* url);
+void performOtaUpdate(const char* url);
 void fetchWeatherFromSupabase();
+bool isGpioPinAllowed(uint8_t pin);
+bool isPinOutputCapable(uint8_t pin);
+bool applyPinMode(uint8_t pin, const char* mode);
+void publishPinRead(uint8_t pin);
 void handleJoystick();
 void handleButton();
 void updateHomeScreenIfNeeded();
@@ -364,8 +377,61 @@ void showStatusScreen() {
   drawInfoScreen();
 }
 
+bool isGpioPinAllowed(uint8_t pin) {
+  if (pin > 39) return false;
+  if (pin >= 6 && pin <= 11) return false;
+  if (pin == TFT_CS || pin == TFT_DC || pin == TFT_RST ||
+      pin == TFT_SCLK || pin == TFT_MOSI ||
+      pin == BME_SDA_PIN || pin == BME_SCL_PIN ||
+      pin == JOY_X_PIN || pin == JOY_Y_PIN || pin == JOY_SW_PIN) {
+    return false;
+  }
+  return true;
+}
+
+bool isPinOutputCapable(uint8_t pin) {
+  if (pin >= 34 && pin <= 39) return false;
+  return true;
+}
+
+bool applyPinMode(uint8_t pin, const char* mode) {
+  if (!isGpioPinAllowed(pin) || !mode) return false;
+
+  if (strcmp(mode, "OUTPUT") == 0) {
+    if (!isPinOutputCapable(pin)) return false;
+    pinMode(pin, OUTPUT);
+    return true;
+  }
+  if (strcmp(mode, "INPUT") == 0) {
+    pinMode(pin, INPUT);
+    return true;
+  }
+  if (strcmp(mode, "INPUT_PULLUP") == 0) {
+    pinMode(pin, INPUT_PULLUP);
+    return true;
+  }
+  return false;
+}
+
+void publishPinRead(uint8_t pin) {
+  if (!mqttClient.connected()) return;
+
+  StaticJsonDocument<128> doc;
+  char keyDig[20];
+  char keyAna[20];
+  snprintf(keyDig, sizeof(keyDig), "pin_%d_digital", pin);
+  snprintf(keyAna, sizeof(keyAna), "pin_%d_analog", pin);
+  doc[keyDig] = digitalRead(pin);
+  doc[keyAna] = analogRead(pin);
+
+  char buf[128];
+  size_t n = serializeJson(doc, buf);
+  mqttClient.publish(topicTelemetry, buf, n);
+  mqttClient.loop();
+}
+
 void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument<384> doc;
   if (deserializeJson(doc, payload, length)) return;
 
   const char* action = doc["action"];
@@ -394,6 +460,66 @@ void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
   if (strcmp(action, "refresh") == 0) {
     Serial.println("[MQTT] refresh outdoor data");
     fetchWeatherFromSupabase();
+    return;
+  }
+
+  if (strcmp(action, "ota") == 0) {
+    const char* url = doc["url"];
+    if (!url || url[0] == '\0') return;
+    if (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0) {
+      Serial.println("[MQTT] ota: invalid url scheme");
+      return;
+    }
+    Serial.printf("[MQTT] ota url=%s\n", url);
+    queueOtaUpdate(url);
+    return;
+  }
+
+  if (strcmp(action, "pin_mode") == 0) {
+    if (!doc["pin"].is<int>()) return;
+    const char* mode = doc["mode"];
+    if (!mode) return;
+    uint8_t pin = doc["pin"];
+    if (!applyPinMode(pin, mode)) {
+      Serial.printf("[MQTT] pin_mode rejected pin=%u mode=%s\n", pin, mode);
+      return;
+    }
+    Serial.printf("[MQTT] pin_mode pin=%u mode=%s\n", pin, mode);
+    return;
+  }
+
+  if (strcmp(action, "pin_write") == 0) {
+    if (!doc["pin"].is<int>() || !doc["value"].is<int>()) return;
+    uint8_t pin = doc["pin"];
+    int value = doc["value"];
+    if (!isGpioPinAllowed(pin)) {
+      Serial.printf("[MQTT] pin_write rejected pin=%u\n", pin);
+      return;
+    }
+    if (value <= 1) {
+      if (!isPinOutputCapable(pin)) return;
+      pinMode(pin, OUTPUT);
+      digitalWrite(pin, value ? HIGH : LOW);
+      Serial.printf("[MQTT] pin_write pin=%u value=%d\n", pin, value);
+    } else {
+      if (!isPinOutputCapable(pin)) return;
+      pinMode(pin, OUTPUT);
+      analogWrite(pin, constrain(value, 0, 255));
+      Serial.printf("[MQTT] pin_write pin=%u pwm=%d\n", pin, constrain(value, 0, 255));
+    }
+    return;
+  }
+
+  if (strcmp(action, "pin_read") == 0) {
+    if (!doc["pin"].is<int>()) return;
+    uint8_t pin = doc["pin"];
+    if (!isGpioPinAllowed(pin)) {
+      Serial.printf("[MQTT] pin_read rejected pin=%u\n", pin);
+      return;
+    }
+    Serial.printf("[MQTT] pin_read pin=%u\n", pin);
+    publishPinRead(pin);
+    return;
   }
 }
 
@@ -449,6 +575,91 @@ void publishMqttTelemetry() {
   char buf[384];
   size_t n = serializeJson(doc, buf);
   mqttClient.publish(topicTelemetry, buf, n);
+}
+
+void publishOtaEvent(const char* phase, int progress) {
+  if (!mqttClient.connected()) return;
+
+  StaticJsonDocument<192> doc;
+  doc["ota"] = phase;
+  if (progress >= 0) doc["progress"] = progress;
+
+  char buf[192];
+  size_t n = serializeJson(doc, buf);
+  mqttClient.publish(topicTelemetry, buf, n);
+  mqttClient.loop();
+}
+
+void queueOtaUpdate(const char* url) {
+  strncpy(otaUrl, url, sizeof(otaUrl) - 1);
+  otaUrl[sizeof(otaUrl) - 1] = '\0';
+  otaPending = true;
+}
+
+void performOtaUpdate(const char* url) {
+  Serial.printf("[OTA] starting: %s (heap=%u)\n", url, ESP.getFreeHeap());
+  setStatus("OTA starting");
+  showMessage("OTA UPDATE", "Downloading...", url);
+  publishOtaEvent("starting", 0);
+  lastOtaProgress = 0;
+
+  // Освобождаем MQTT-сокет и память перед HTTPS-загрузкой
+  if (mqttClient.connected()) {
+    mqttClient.disconnect();
+    delay(200);
+  }
+  WiFi.setSleep(WIFI_PS_NONE);
+  Serial.printf("[OTA] heap after cleanup: %u\n", ESP.getFreeHeap());
+
+  httpUpdate.rebootOnUpdate(true);
+  httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+
+  httpUpdate.onStart([]() {
+    Serial.println("[OTA] start");
+    publishOtaEvent("downloading", 0);
+    lastOtaProgress = 0;
+  });
+
+  httpUpdate.onProgress([](size_t current, size_t total) {
+    int pct = (total > 0) ? (int)((current * 100UL) / total) : 0;
+    Serial.printf("[OTA] %d%%\n", pct);
+    if (pct >= lastOtaProgress + 10 || pct == 100) {
+      lastOtaProgress = pct;
+      publishOtaEvent("downloading", pct);
+      setStatus("OTA downloading");
+    }
+  });
+
+  httpUpdate.onEnd([]() {
+    Serial.println("[OTA] complete");
+    publishOtaEvent("rebooting", 100);
+    setStatus("OTA rebooting");
+  });
+
+  httpUpdate.onError([](int error) {
+    Serial.printf("[OTA] error %d: %s\n", error, httpUpdate.getLastErrorString().c_str());
+    publishOtaEvent("failed", -1);
+    setStatus("OTA failed");
+  });
+
+  t_httpUpdate_return ret;
+  if (strncmp(url, "https://", 8) == 0) {
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure();
+    secureClient.setTimeout(30000);
+    ret = httpUpdate.update(secureClient, url);
+  } else {
+    WiFiClient client;
+    client.setTimeout(30000);
+    ret = httpUpdate.update(client, url);
+  }
+
+  if (ret != HTTP_UPDATE_OK) {
+    Serial.printf("[OTA] failed: %s\n", httpUpdate.getLastErrorString().c_str());
+    showMessage("OTA FAILED", httpUpdate.getLastErrorString().c_str(), "");
+    delay(3000);
+    drawCurrentScreen();
+  }
 }
 
 void syncTime() {
@@ -1137,6 +1348,12 @@ void setup() {
 }
 
 void loop() {
+  if (otaPending) {
+    otaPending = false;
+    performOtaUpdate(otaUrl);
+    return;
+  }
+
   unsigned long now = millis();
 
   if (WiFi.status() == WL_CONNECTED) {

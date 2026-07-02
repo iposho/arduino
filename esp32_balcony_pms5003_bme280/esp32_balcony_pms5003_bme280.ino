@@ -1,6 +1,8 @@
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <HTTPClient.h>
+#include <HTTPUpdate.h>
 #include <ArduinoJson.h>
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
@@ -312,6 +314,10 @@ char topicCommand[64];
 bool mqttTopicsReady = false;
 unsigned long lastMqttTelemetry = 0;
 
+char otaUrl[256] = "";
+bool otaPending = false;
+int lastOtaProgress = -1;
+
 uint8_t oledPage = 0;
 unsigned long lastOledUpdate = 0;
 bool oledStatusHold = false;
@@ -326,6 +332,10 @@ void    setBoardLed(bool on);
 void    showStatusScreen();
 void    ensureMqtt();
 void    publishMqttTelemetry();
+void    publishOtaEvent(const char* phase, int progress = -1);
+void    queueOtaUpdate(const char* url);
+void    performOtaUpdate(const char* url);
+void    showOtaScreen(const char* line1, const char* line2);
 bool    sendDataToSupabase(float t, float h, float p);
 bool    pushClimateToSupabase();
 void    sendTelegramMessage(String message);
@@ -578,6 +588,12 @@ void setup() {
 // LOOP
 // ============================================================
 void loop() {
+  if (otaPending) {
+    otaPending = false;
+    performOtaUpdate(otaUrl);
+    return;
+  }
+
   // СБРОС СТОРОЖЕВОГО ТАЙМЕРА (Кормим собаку)
   esp_task_wdt_reset();
 
@@ -1040,7 +1056,7 @@ void showStatusScreen() {
 }
 
 void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument<384> doc;
   if (deserializeJson(doc, payload, length)) return;
 
   const char* action = doc["action"];
@@ -1076,6 +1092,18 @@ void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
   if (strcmp(action, "push") == 0) {
     Serial.println("[MQTT] push to Supabase");
     pushClimateToSupabase();
+    return;
+  }
+
+  if (strcmp(action, "ota") == 0) {
+    const char* url = doc["url"];
+    if (!url || url[0] == '\0') return;
+    if (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0) {
+      Serial.println("[MQTT] ota: invalid url scheme");
+      return;
+    }
+    Serial.printf("[MQTT] ota url=%s\n", url);
+    queueOtaUpdate(url);
     return;
   }
 }
@@ -1141,6 +1169,98 @@ void publishMqttTelemetry() {
   char buf[512];
   size_t n = serializeJson(doc, buf);
   mqttClient.publish(topicTelemetry, buf, n);
+}
+
+void showOtaScreen(const char* line1, const char* line2) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("OTA UPDATE");
+  display.println(line1);
+  display.println(line2);
+  display.display();
+}
+
+void publishOtaEvent(const char* phase, int progress) {
+  if (!mqttClient.connected()) return;
+
+  StaticJsonDocument<192> doc;
+  doc["ota"] = phase;
+  if (progress >= 0) doc["progress"] = progress;
+
+  char buf[192];
+  size_t n = serializeJson(doc, buf);
+  mqttClient.publish(topicTelemetry, buf, n);
+  mqttClient.loop();
+}
+
+void queueOtaUpdate(const char* url) {
+  strncpy(otaUrl, url, sizeof(otaUrl) - 1);
+  otaUrl[sizeof(otaUrl) - 1] = '\0';
+  otaPending = true;
+}
+
+void performOtaUpdate(const char* url) {
+  Serial.printf("[OTA] starting: %s\n", url);
+  showOtaScreen("Downloading...", url);
+  publishOtaEvent("starting", 0);
+  lastOtaProgress = 0;
+
+  httpUpdate.rebootOnUpdate(true);
+  httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+
+  httpUpdate.onStart([]() {
+    Serial.println("[OTA] start");
+    esp_task_wdt_reset();
+    publishOtaEvent("downloading", 0);
+    lastOtaProgress = 0;
+  });
+
+  httpUpdate.onProgress([](size_t current, size_t total) {
+    esp_task_wdt_reset();
+    int pct = (total > 0) ? (int)((current * 100UL) / total) : 0;
+    Serial.printf("[OTA] %d%%\n", pct);
+    if (pct >= lastOtaProgress + 10 || pct == 100) {
+      lastOtaProgress = pct;
+      publishOtaEvent("downloading", pct);
+      char line[16];
+      snprintf(line, sizeof(line), "%d%%", pct);
+      showOtaScreen("Downloading...", line);
+    }
+  });
+
+  httpUpdate.onEnd([]() {
+    Serial.println("[OTA] complete");
+    esp_task_wdt_reset();
+    publishOtaEvent("rebooting", 100);
+    showOtaScreen("Complete", "Rebooting...");
+  });
+
+  httpUpdate.onError([](int error) {
+    Serial.printf("[OTA] error %d: %s\n", error, httpUpdate.getLastErrorString().c_str());
+    esp_task_wdt_reset();
+    publishOtaEvent("failed", -1);
+    showOtaScreen("FAILED", httpUpdate.getLastErrorString().c_str());
+  });
+
+  t_httpUpdate_return ret;
+  if (strncmp(url, "https://", 8) == 0) {
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure();
+    ret = httpUpdate.update(secureClient, url);
+  } else {
+    WiFiClient client;
+    ret = httpUpdate.update(client, url);
+  }
+
+  if (ret != HTTP_UPDATE_OK) {
+    Serial.printf("[OTA] failed: %s\n", httpUpdate.getLastErrorString().c_str());
+    showOtaScreen("FAILED", httpUpdate.getLastErrorString().c_str());
+    eventLog.add("OTA FAIL");
+    delay(3000);
+    updateOled(oledPage);
+  }
 }
 
 // ============================================================

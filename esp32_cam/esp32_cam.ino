@@ -1,5 +1,8 @@
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <PubSubClient.h>
+#include <HTTPClient.h>
+#include <HTTPUpdate.h>
 #include <WebServer.h>
 #include <ArduinoJson.h>
 #include <time.h>
@@ -73,6 +76,10 @@ unsigned long lastCaptureTime = 0;
 unsigned long lastMqttTelemetry = 0;
 unsigned long lastWifiRetry = 0;
 
+char otaUrl[256] = "";
+bool otaPending = false;
+int lastOtaProgress = -1;
+
 // =====================
 // Forward declarations
 // =====================
@@ -87,6 +94,9 @@ void syncTime();
 void initMqttTopics();
 void ensureMqtt();
 void publishMqttTelemetry();
+void publishOtaEvent(const char* phase, int progress = -1);
+void queueOtaUpdate(const char* url);
+void performOtaUpdate(const char* url);
 void handleMqttCommand(char* topic, byte* payload, unsigned int length);
 void startWebServer();
 void ensureWebServer();
@@ -380,7 +390,7 @@ void initMqttTopics() {
 }
 
 void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument<384> doc;
   if (deserializeJson(doc, payload, length)) return;
 
   const char* action = doc["action"];
@@ -398,11 +408,25 @@ void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
     Serial.println("[MQTT] reboot");
     delay(300);
     ESP.restart();
+    return;
   }
 
   if (strcmp(action, "capture") == 0) {
     Serial.println("[MQTT] capture");
     captureRequested = true;
+    return;
+  }
+
+  if (strcmp(action, "ota") == 0) {
+    const char* url = doc["url"];
+    if (!url || url[0] == '\0') return;
+    if (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0) {
+      Serial.println("[MQTT] ota: invalid url scheme");
+      return;
+    }
+    Serial.printf("[MQTT] ota url=%s\n", url);
+    queueOtaUpdate(url);
+    return;
   }
 }
 
@@ -454,6 +478,79 @@ void publishMqttTelemetry() {
   char buf[512];
   size_t n = serializeJson(doc, buf);
   mqttClient.publish(topicTelemetry, buf, n);
+}
+
+void publishOtaEvent(const char* phase, int progress) {
+  if (!mqttClient.connected()) return;
+
+  StaticJsonDocument<192> doc;
+  doc["ota"] = phase;
+  if (progress >= 0) doc["progress"] = progress;
+
+  char buf[192];
+  size_t n = serializeJson(doc, buf);
+  mqttClient.publish(topicTelemetry, buf, n);
+  mqttClient.loop();
+}
+
+void queueOtaUpdate(const char* url) {
+  strncpy(otaUrl, url, sizeof(otaUrl) - 1);
+  otaUrl[sizeof(otaUrl) - 1] = '\0';
+  otaPending = true;
+}
+
+void performOtaUpdate(const char* url) {
+  Serial.printf("[OTA] starting: %s\n", url);
+  setStatus("OTA starting");
+  publishOtaEvent("starting", 0);
+  lastOtaProgress = 0;
+
+  httpUpdate.rebootOnUpdate(true);
+  httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+
+  httpUpdate.onStart([]() {
+    Serial.println("[OTA] start");
+    publishOtaEvent("downloading", 0);
+    lastOtaProgress = 0;
+    setStatus("OTA downloading");
+  });
+
+  httpUpdate.onProgress([](size_t current, size_t total) {
+    int pct = (total > 0) ? (int)((current * 100UL) / total) : 0;
+    Serial.printf("[OTA] %d%%\n", pct);
+    if (pct >= lastOtaProgress + 10 || pct == 100) {
+      lastOtaProgress = pct;
+      publishOtaEvent("downloading", pct);
+      setStatus("OTA downloading");
+    }
+  });
+
+  httpUpdate.onEnd([]() {
+    Serial.println("[OTA] complete");
+    publishOtaEvent("rebooting", 100);
+    setStatus("OTA rebooting");
+  });
+
+  httpUpdate.onError([](int error) {
+    Serial.printf("[OTA] error %d: %s\n", error, httpUpdate.getLastErrorString().c_str());
+    publishOtaEvent("failed", -1);
+    setStatus("OTA failed");
+  });
+
+  t_httpUpdate_return ret;
+  if (strncmp(url, "https://", 8) == 0) {
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure();
+    ret = httpUpdate.update(secureClient, url);
+  } else {
+    WiFiClient client;
+    ret = httpUpdate.update(client, url);
+  }
+
+  if (ret != HTTP_UPDATE_OK) {
+    Serial.printf("[OTA] failed: %s\n", httpUpdate.getLastErrorString().c_str());
+    setStatus("OTA failed");
+  }
 }
 
 // =====================
@@ -639,6 +736,12 @@ void setup() {
 }
 
 void loop() {
+  if (otaPending) {
+    otaPending = false;
+    performOtaUpdate(otaUrl);
+    return;
+  }
+
   unsigned long now = millis();
 
   if (WiFi.status() != WL_CONNECTED) {
