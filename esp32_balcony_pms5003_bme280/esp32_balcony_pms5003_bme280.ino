@@ -326,7 +326,8 @@ void    setBoardLed(bool on);
 void    showStatusScreen();
 void    ensureMqtt();
 void    publishMqttTelemetry();
-void    sendDataToSupabase(float t, float h, float p);
+bool    sendDataToSupabase(float t, float h, float p);
+bool    pushClimateToSupabase();
 void    sendTelegramMessage(String message);
 bool    readClimate(float &t, float &h, float &p);
 bool    isClimateValid(float t, float h, float p);
@@ -336,6 +337,7 @@ void    setLedColor(bool r, bool g, bool y);
 void    updateTrafficLight();
 void    updateOled(uint8_t page);
 void    checkTelegramCommands();
+bool    syncTime();
 void    updateTimeStr(char* buf, size_t len);
 void    formatClockShort(char* buf, size_t len);
 void    formatNextWallTime(unsigned long targetMs, unsigned long nowMs, char* buf, size_t len);
@@ -455,18 +457,7 @@ void setup() {
     lastWifiConnectedTime = millis();
     ensureMqtt();
 
-    // NTP-синхронизация
-    configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET, NTP_SERVER);
-    struct tm timeinfo;
-    if (getLocalTime(&timeinfo, 5000)) {
-      ntpSynced = true;
-      updateTimeStr(bootTimeStr, sizeof(bootTimeStr));
-      Serial.printf("[NTP] Синхронизировано: %s\n", bootTimeStr);
-      eventLog.add("NTP OK");
-    } else {
-      Serial.println("[NTP] Не удалось синхронизировать время");
-      logError("NTP sync FAIL");
-    }
+    syncTime();
 
     Serial.println("[Система] Старт полноценного прогрева PMS5003 для честного стартового замера...");
     pms.wakeUp();
@@ -802,24 +793,7 @@ void loop() {
   // ── 7. Отправка в Supabase каждые 5 мин ──
   if (now - lastClimateSendTime >= CLIMATE_SEND_INTERVAL) {
     Serial.println("\n--- Отправка (5 мин) ---");
-
-    float fT, fH, fP;
-    if (climateBufferIndex > 0) {
-      fT = getMedian(tempBuffer, climateBufferIndex);
-      fH = getMedian(humBuffer,  climateBufferIndex);
-      fP = getMedian(presBuffer, climateBufferIndex);
-      climateBufferIndex = 0;
-    } else {
-      if (!readClimate(fT, fH, fP)) {
-        Serial.println("[Supabase] Нет климата — пропуск.");
-        lastClimateSendTime = millis();
-        climateBufferIndex = 0;
-        return;
-      }
-    }
-
-    sendDataToSupabase(fT, fH, fP);
-    lastClimateSendTime = millis();
+    pushClimateToSupabase();
   }
 
   // ── 8. Telegram-команды (удалённый ребут/статус) ──
@@ -910,8 +884,32 @@ String pmsStatsJson(const char* prefix, PmsStats &s) {
 // ============================================================
 // Supabase POST
 // ============================================================
-void sendDataToSupabase(float t, float h, float p) {
-  if (WiFi.status() != WL_CONNECTED) return;
+bool pushClimateToSupabase() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[Supabase] Нет Wi-Fi — пропуск.");
+    return false;
+  }
+
+  float fT, fH, fP;
+  if (climateBufferIndex > 0) {
+    fT = getMedian(tempBuffer, climateBufferIndex);
+    fH = getMedian(humBuffer,  climateBufferIndex);
+    fP = getMedian(presBuffer, climateBufferIndex);
+    climateBufferIndex = 0;
+  } else if (!readClimate(fT, fH, fP)) {
+    Serial.println("[Supabase] Нет климата — пропуск.");
+    lastClimateSendTime = millis();
+    climateBufferIndex = 0;
+    return false;
+  }
+
+  bool ok = sendDataToSupabase(fT, fH, fP);
+  lastClimateSendTime = millis();
+  return ok;
+}
+
+bool sendDataToSupabase(float t, float h, float p) {
+  if (WiFi.status() != WL_CONNECTED) return false;
 
   esp_task_wdt_reset();
   HTTPClient http;
@@ -958,6 +956,7 @@ void sendDataToSupabase(float t, float h, float p) {
     supabaseErrorCount = 0;
     eventLog.add("Supabase OK");
     if (ntpSynced) updateTimeStr(lastCloudSendTimeStr, sizeof(lastCloudSendTimeStr));
+    return true;
   } else {
     supabaseErrorCount++;
     supabaseTotalErrors++;
@@ -984,6 +983,7 @@ void sendDataToSupabase(float t, float h, float p) {
       supabaseErrorCount = 0;
     }
   }
+  return false;
 }
 
 // ============================================================
@@ -1064,6 +1064,19 @@ void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
   if (strcmp(action, "status") == 0) {
     Serial.println("[MQTT] status screen");
     showStatusScreen();
+    return;
+  }
+
+  if (strcmp(action, "sync") == 0) {
+    Serial.println("[MQTT] sync time");
+    syncTime();
+    return;
+  }
+
+  if (strcmp(action, "push") == 0) {
+    Serial.println("[MQTT] push to Supabase");
+    pushClimateToSupabase();
+    return;
   }
 }
 
@@ -1272,6 +1285,24 @@ void checkTelegramCommands() {
     sendTelegramMessage(msg);
   }
 
+  if (payload.indexOf("/balcony_sync") >= 0) {
+    Serial.println("[Telegram] Получена команда /balcony_sync");
+    bool ok = syncTime();
+    String msg = ok
+      ? "🕐 *БАЛКОН — Время синхронизировано*\n`" + String(bootTimeStr) + "`"
+      : "❌ *БАЛКОН — NTP sync failed*";
+    sendTelegramMessage(msg);
+  }
+
+  if (payload.indexOf("/balcony_push") >= 0) {
+    Serial.println("[Telegram] Получена команда /balcony_push");
+    bool ok = pushClimateToSupabase();
+    String msg = ok
+      ? "☁️ *БАЛКОН — Данные отправлены в Supabase*\n`" + String(lastCloudSendTimeStr) + "`"
+      : "❌ *БАЛКОН — Отправка в Supabase failed*";
+    sendTelegramMessage(msg);
+  }
+
   if (payload.indexOf("/balcony_errors") >= 0) {
     Serial.println("[Telegram] Получена команда /balcony_errors");
     String msg = "🚨 *БАЛКОН — Лог ошибок*\n";
@@ -1286,8 +1317,34 @@ void checkTelegramCommands() {
 }
 
 // ============================================================
-// NTP — форматирование времени
+// NTP — синхронизация и форматирование времени
 // ============================================================
+bool syncTime() {
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET, NTP_SERVER);
+
+  Serial.print("[NTP] sync");
+  struct tm timeinfo;
+  int tries = 0;
+  while (!getLocalTime(&timeinfo, 500) && tries < 10) {
+    esp_task_wdt_reset();
+    delay(500);
+    Serial.print(".");
+    tries++;
+  }
+
+  if (getLocalTime(&timeinfo, 0)) {
+    ntpSynced = true;
+    updateTimeStr(bootTimeStr, sizeof(bootTimeStr));
+    Serial.printf(" OK (%s)\n", bootTimeStr);
+    eventLog.add("NTP OK");
+    return true;
+  }
+
+  Serial.println(" FAIL");
+  logError("NTP sync FAIL");
+  return false;
+}
+
 void updateTimeStr(char* buf, size_t len) {
   struct tm timeinfo;
   if (getLocalTime(&timeinfo, 0)) {
