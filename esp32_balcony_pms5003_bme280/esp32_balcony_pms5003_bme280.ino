@@ -1,6 +1,5 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
-#include <WebServer.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Wire.h>
@@ -304,9 +303,6 @@ const unsigned long TELEGRAM_CHECK_INTERVAL = 60UL * 1000UL;
 long telegramUpdateId = 0;
 bool telegramOffsetInit = false;
 
-WebServer statusServer(80);
-bool webServerStarted = false;
-
 WiFiClient mqttNet;
 PubSubClient mqttClient(mqttNet);
 
@@ -324,9 +320,6 @@ bool boardLedOn = false;
 
 // Forward declarations
 void    connectToWiFi();
-void    startWebServer();
-void    ensureWebServer();
-void    handleStatusPage();
 void    initMqttTopics();
 void    handleMqttCommand(char* topic, byte* payload, unsigned int length);
 void    setBoardLed(bool on);
@@ -460,7 +453,6 @@ void setup() {
   if (WiFi.status() == WL_CONNECTED) {
     eventLog.add("WiFi OK");
     lastWifiConnectedTime = millis();
-    ensureWebServer();
     ensureMqtt();
 
     // NTP-синхронизация
@@ -616,7 +608,6 @@ void loop() {
     }
   } else {
     lastWifiConnectedTime = now; // Сбрасываем таймер ошибки сети
-    ensureWebServer();
     ensureMqtt();
     mqttClient.loop();
 
@@ -625,8 +616,6 @@ void loop() {
       publishMqttTelemetry();
     }
   }
-
-  statusServer.handleClient();
 
   // Профилактический суточный ребут (защита от утечек памяти)
   if (now > 24UL * 60UL * 60UL * 1000UL) {
@@ -994,122 +983,6 @@ void sendDataToSupabase(float t, float h, float p) {
       sendTelegramMessage(alert);
       supabaseErrorCount = 0;
     }
-  }
-}
-
-// ============================================================
-// Веб-статус (http://<ip>/)
-// ============================================================
-String htmlRow(const char* label, const String& value, const char* valueClass = "") {
-  String row = "<tr><td class=\"k\">";
-  row += label;
-  row += "</td><td";
-  if (valueClass[0] != '\0') {
-    row += " class=\"";
-    row += valueClass;
-    row += "\"";
-  }
-  row += ">";
-  row += value;
-  row += "</td></tr>";
-  return row;
-}
-
-void handleStatusPage() {
-  String html;
-  html.reserve(4096);
-
-  html += F("<!DOCTYPE html><html lang=\"ru\"><head><meta charset=\"utf-8\">"
-            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-            "<meta http-equiv=\"refresh\" content=\"10\">"
-            "<title>");
-  html += DEVICE_HOSTNAME;
-  html += F("</title><style>"
-            "body{font-family:system-ui,sans-serif;background:#0a0c12;color:#e8eaef;margin:0;padding:16px}"
-            "h1{font-size:1.25rem;margin:0 0 4px}p.sub{color:#96a0b4;font-size:.85rem;margin:0 0 16px}"
-            "section{background:#161a26;border-radius:10px;padding:12px 14px;margin-bottom:12px}"
-            "h2{font-size:.75rem;text-transform:uppercase;letter-spacing:.06em;color:#7b8499;margin:0 0 10px}"
-            "table{width:100%;border-collapse:collapse}td{padding:5px 0;border-bottom:1px solid #222836;font-size:.9rem}"
-            "td.k{color:#96a0b4;width:44%}.ok{color:#3ecf8e}.bad{color:#ff5c6c}.warn{color:#ffb020}"
-            "</style></head><body><h1>");
-  html += DEVICE_HOSTNAME;
-  html += F("</h1><p class=\"sub\">Балконная метеостанция · автообновление 10 с</p>");
-
-  html += F("<section><h2>Сеть</h2><table>");
-  bool wifiOk = WiFi.status() == WL_CONNECTED;
-  html += htmlRow("Wi-Fi", wifiOk ? "Подключено" : "Нет связи", wifiOk ? "ok" : "bad");
-  if (wifiOk) {
-    html += htmlRow("IP", WiFi.localIP().toString());
-    html += htmlRow("Hostname", WiFi.getHostname());
-    html += htmlRow("RSSI", String(WiFi.RSSI()) + " dBm");
-    html += htmlRow("SSID", WiFi.SSID());
-  }
-  html += htmlRow("Uptime", formatUptime(millis()));
-  if (ntpSynced) {
-    html += htmlRow("Время загрузки", bootTimeStr);
-  }
-  html += htmlRow("MQTT", mqttClient.connected() ? "Подключено" : "Нет связи",
-                  mqttClient.connected() ? "ok" : "bad");
-  html += F("</table></section>");
-
-  html += F("<section><h2>Климат (BME280)</h2><table>");
-  html += htmlRow("Датчик", bmeReady ? "OK" : "Ошибка", bmeReady ? "ok" : "bad");
-  if (hasClimateReading) {
-    html += htmlRow("Температура", String(lastClimateTemp, 1) + " °C");
-    html += htmlRow("Влажность", String(lastClimateHum, 0) + " %");
-    html += htmlRow("Давление", String(lastClimatePres, 1) + " mmHg");
-    html += htmlRow("Последний замер", lastClimateTimeStr);
-  } else {
-    html += htmlRow("Показания", "Нет данных", "warn");
-  }
-  html += htmlRow("Stale BME", String(staleBmeCount) + "/" + String(STALE_BME_THRESHOLD));
-  html += F("</table></section>");
-
-  html += F("<section><h2>Пыль (PMS5003)</h2><table>");
-  String pmsState = pmsSampling ? "Серия замеров" : (pmsIsAwake ? "Прогрев" : "Сон");
-  html += htmlRow("Состояние", pmsState);
-  if (hasPmsStats) {
-    html += htmlRow("PM1.0", String((int)lastStatsPm1.median) + " мкг/м³");
-    html += htmlRow("PM2.5", String((int)lastStatsPm25.median) + " мкг/м³");
-    html += htmlRow("PM10", String((int)lastStatsPm10.median) + " мкг/м³");
-    html += htmlRow("Выборка", "n=" + String(lastStatsPm25.count));
-    html += htmlRow("Последний цикл", lastPmsTimeStr);
-  } else {
-    html += htmlRow("Показания", "Нет данных", "warn");
-  }
-  if (pmsErrorCount > 0) {
-    html += htmlRow("Ошибки подряд", String(pmsErrorCount), "bad");
-  }
-  html += htmlRow("Stale PMS", String(stalePmsCount) + "/" + String(STALE_PMS_THRESHOLD));
-  html += F("</table></section>");
-
-  html += F("<section><h2>Облако</h2><table>");
-  html += htmlRow("Последняя отправка", lastCloudSendTimeStr);
-  html += htmlRow("Ошибок Supabase", String(supabaseTotalErrors),
-                  supabaseTotalErrors == 0 ? "ok" : "bad");
-  html += F("</table></section>");
-
-  html += F("<section><h2>Система</h2><table>");
-  html += htmlRow("CPU", String(temperatureRead(), 1) + " °C");
-  html += htmlRow("Heap", String(ESP.getFreeHeap()) + " B (min " + String(sessionMinHeap) + ")");
-  html += htmlRow("Причина ребута", rebootReasonShort);
-  html += F("</table></section></body></html>");
-
-  statusServer.send(200, "text/html; charset=utf-8", html);
-}
-
-void startWebServer() {
-  if (webServerStarted) return;
-  statusServer.on("/", handleStatusPage);
-  statusServer.begin();
-  webServerStarted = true;
-  Serial.printf("[Web] http://%s/ (%s.local)\n",
-                WiFi.localIP().toString().c_str(), DEVICE_HOSTNAME);
-}
-
-void ensureWebServer() {
-  if (WiFi.status() == WL_CONNECTED && !webServerStarted) {
-    startWebServer();
   }
 }
 

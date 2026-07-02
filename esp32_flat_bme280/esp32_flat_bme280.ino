@@ -2,7 +2,6 @@
 #include <SPI.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
-#include <WebServer.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <time.h>
@@ -169,9 +168,6 @@ int lastDisplayedPressure = -999;
 // =====================
 char statusLine[40] = "Starting...";
 
-WebServer statusServer(80);
-bool webServerStarted = false;
-
 // =====================
 // MQTT (шлюз esp32.kuzyak.in)
 // =====================
@@ -187,9 +183,6 @@ unsigned long lastMqttTelemetry = 0;
 // =====================
 // Forward declarations
 // =====================
-void startWebServer();
-void ensureWebServer();
-void handleStatusPage();
 const char* getAqiLevel(int value);
 const char* getAqiAdvice(int value);
 void drawCurrentScreen();
@@ -311,21 +304,6 @@ void formatTime(char* buffer, size_t size) {
 
   struct tm* t = localtime(&now);
   snprintf(buffer, size, "%02d:%02d", t->tm_hour, t->tm_min);
-}
-
-String formatUptime(unsigned long ms) {
-  unsigned long sec = ms / 1000UL;
-  return String(sec / 3600UL) + "ч " + String((sec % 3600UL) / 60UL) + "м";
-}
-
-String formatDateTime() {
-  time_t now = time(nullptr);
-  if (now < 100000) return "—";
-  struct tm* t = localtime(&now);
-  char buf[20];
-  snprintf(buf, sizeof(buf), "%02d.%02d %02d:%02d",
-           t->tm_mday, t->tm_mon + 1, t->tm_hour, t->tm_min);
-  return String(buf);
 }
 
 // =====================
@@ -471,119 +449,6 @@ void publishMqttTelemetry() {
   char buf[384];
   size_t n = serializeJson(doc, buf);
   mqttClient.publish(topicTelemetry, buf, n);
-}
-
-// =====================
-// Веб-статус (http://<ip>/)
-// =====================
-String htmlRow(const char* label, const String& value, const char* valueClass = "") {
-  String row = "<tr><td class=\"k\">";
-  row += label;
-  row += "</td><td";
-  if (valueClass[0] != '\0') {
-    row += " class=\"";
-    row += valueClass;
-    row += "\"";
-  }
-  row += ">";
-  row += value;
-  row += "</td></tr>";
-  return row;
-}
-
-void handleStatusPage() {
-  String html;
-  html.reserve(4096);
-
-  html += F("<!DOCTYPE html><html lang=\"ru\"><head><meta charset=\"utf-8\">"
-            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-            "<meta http-equiv=\"refresh\" content=\"10\">"
-            "<title>");
-  html += DEVICE_HOSTNAME;
-  html += F("</title><style>"
-            "body{font-family:system-ui,sans-serif;background:#0a0c12;color:#e8eaef;margin:0;padding:16px}"
-            "h1{font-size:1.25rem;margin:0 0 4px}p.sub{color:#96a0b4;font-size:.85rem;margin:0 0 16px}"
-            "section{background:#161a26;border-radius:10px;padding:12px 14px;margin-bottom:12px}"
-            "h2{font-size:.75rem;text-transform:uppercase;letter-spacing:.06em;color:#7b8499;margin:0 0 10px}"
-            "table{width:100%;border-collapse:collapse}td{padding:5px 0;border-bottom:1px solid #222836;font-size:.9rem}"
-            "td.k{color:#96a0b4;width:44%}.ok{color:#3ecf8e}.bad{color:#ff5c6c}.warn{color:#ffb020}"
-            "</style></head><body><h1>");
-  html += DEVICE_HOSTNAME;
-  html += F("</h1><p class=\"sub\">Квартирная станция · автообновление 10 с</p>");
-
-  html += F("<section><h2>Сеть</h2><table>");
-  bool wifiOk = WiFi.status() == WL_CONNECTED;
-  html += htmlRow("Wi-Fi", wifiOk ? "Подключено" : "Нет связи", wifiOk ? "ok" : "bad");
-  if (wifiOk) {
-    html += htmlRow("IP", WiFi.localIP().toString());
-    html += htmlRow("Hostname", WiFi.getHostname());
-    html += htmlRow("RSSI", String(WiFi.RSSI()) + " dBm");
-    html += htmlRow("SSID", WiFi.SSID());
-  }
-  html += htmlRow("Uptime", formatUptime(millis()));
-  html += htmlRow("Время", formatDateTime());
-  html += htmlRow("Статус", statusLine);
-  html += htmlRow("MQTT", mqttClient.connected() ? "Подключено" : "Нет связи",
-                  mqttClient.connected() ? "ok" : "bad");
-  html += F("</table></section>");
-
-  html += F("<section><h2>Дом (BME280)</h2><table>");
-  html += htmlRow("Датчик", bmeReady ? "OK" : "Ошибка", bmeReady ? "ok" : "bad");
-  if (bmeReady) {
-    float t = (filteredTemp > -900) ? filteredTemp : bme.readTemperature();
-    float h = (filteredHum > -900)  ? filteredHum  : bme.readHumidity();
-    float p = (filteredPres > -900) ? filteredPres : hPaToMmHg(bme.readPressure() / 100.0);
-    html += htmlRow("Температура", String(t, 1) + " °C");
-    html += htmlRow("Влажность", String(h, 0) + " %");
-    html += htmlRow("Давление", String(p, 1) + " mmHg");
-  } else {
-    html += htmlRow("Показания", "Нет данных", "warn");
-  }
-  html += F("</table></section>");
-
-  html += F("<section><h2>Улица (Supabase)</h2><table>");
-  if (outDataValid) {
-    html += htmlRow("Температура", String(outTemp, 1) + " °C");
-    html += htmlRow("Влажность", String(outHumidity, 0) + " %");
-    html += htmlRow("Давление", String(outPressure, 1) + " mmHg");
-    html += htmlRow("PM2.5", String(outPm25, 1) + " мкг/м³");
-    html += htmlRow("PM10", String(outPm10, 1) + " мкг/м³");
-  } else {
-    html += htmlRow("Данные", "Не загружены", "warn");
-  }
-  html += F("</table></section>");
-
-  html += F("<section><h2>AQI</h2><table>");
-  if (aqiDataValid) {
-    html += htmlRow("Индекс", String(aqiValue));
-    html += htmlRow("Уровень", getAqiLevel(aqiValue));
-    html += htmlRow("Совет", getAqiAdvice(aqiValue));
-  } else {
-    html += htmlRow("Расчёт", "Недоступен", "warn");
-  }
-  html += F("</table></section>");
-
-  html += F("<section><h2>Система</h2><table>");
-  html += htmlRow("Heap", String(ESP.getFreeHeap()) + " B");
-  html += htmlRow("Экран", String((int)currentScreen + 1) + "/" + String((int)SCREEN_COUNT));
-  html += F("</table></section></body></html>");
-
-  statusServer.send(200, "text/html; charset=utf-8", html);
-}
-
-void startWebServer() {
-  if (webServerStarted) return;
-  statusServer.on("/", handleStatusPage);
-  statusServer.begin();
-  webServerStarted = true;
-  Serial.printf("[Web] http://%s/ (%s.local)\n",
-                WiFi.localIP().toString().c_str(), DEVICE_HOSTNAME);
-}
-
-void ensureWebServer() {
-  if (WiFi.status() == WL_CONNECTED && !webServerStarted) {
-    startWebServer();
-  }
 }
 
 void syncTime() {
@@ -1255,7 +1120,6 @@ void setup() {
   }
 
   connectWiFi();
-  ensureWebServer();
   ensureMqtt();
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -1274,9 +1138,6 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
-
-  ensureWebServer();
-  statusServer.handleClient();
 
   if (WiFi.status() == WL_CONNECTED) {
     ensureMqtt();

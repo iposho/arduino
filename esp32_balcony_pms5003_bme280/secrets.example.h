@@ -11,9 +11,11 @@
 #define MQTT_USER        "esp32"
 #define MQTT_PASS        "change-me-esp32"
 
+// Supabase REST API
 #define SUPABASE_URL     "https://your-project.supabase.co/rest/v1/weather_logs"
 #define SUPABASE_KEY     "your-supabase-anon-key"
 
+// Telegram: два бота — уведомления и команды (раздельно!)
 #define TELEGRAM_TOKEN       "your-telegram-bot-token"       // Бот для уведомлений
-#define TELEGRAM_CMD_TOKEN   "your-telegram-cmd-bot-token"   // Бот для команд (отдельный!)
+#define TELEGRAM_CMD_TOKEN   "your-telegram-cmd-bot-token"   // Бот для команд
 #define TELEGRAM_CHAT_ID     "your-telegram-chat-id"
