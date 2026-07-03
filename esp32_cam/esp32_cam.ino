@@ -50,6 +50,7 @@ const unsigned long NTP_GMT_OFFSET_SEC      = 4UL * 3600UL;
 
 const uint16_t MAX_PHOTOS = 4800;
 const char* PHOTOS_DIR = "/photos";
+const char* PHOTO_INDEX_FILE = "/photo_index.dat";
 
 // =====================
 // State
@@ -87,9 +88,12 @@ int lastOtaProgress = -1;
 bool littleFsReady = false;
 bool otaInProgress = false;
 char otaPhase[24] = "";
+char otaFailedPhase[24] = "";
+char otaErrorMsg[96] = "";
 int otaProgressPct = -1;
 size_t otaBytesDone = 0;
 size_t otaBytesTotal = 0;
+unsigned long otaStartedMs = 0;
 
 // =====================
 // Forward declarations
@@ -99,6 +103,8 @@ void setFlashLed(bool on);
 bool initCamera();
 bool initSdCard();
 void restorePhotoIndex();
+void persistPhotoIndex();
+bool loadPhotoIndexFromFs();
 bool captureAndSavePhoto();
 void connectWiFi();
 void syncTime();
@@ -120,11 +126,15 @@ void handleMqttCommand(char* topic, byte* payload, unsigned int length);
 void startWebServer();
 void ensureWebServer();
 void handleStatusPage();
+void handleOtaStatus();
 void handleLatestPhoto();
 void handlePhotoById();
 String formatUptime(unsigned long ms);
 String formatDateTime();
 String htmlRow(const char* label, const String& value, const char* valueClass = "");
+const char* otaPhaseLabel(const char* phase);
+int otaPhaseOrder(const char* phase);
+String htmlOtaStep(const char* label, int step, int currentStep, bool failed, int failedStep);
 
 // =====================
 // Helpers
@@ -190,7 +200,7 @@ bool initCamera() {
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  config.frame_size = FRAMESIZE_SVGA;
+  config.frame_size = FRAMESIZE_HD;
   config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode = CAMERA_GRAB_LATEST;
   config.fb_location = CAMERA_FB_IN_PSRAM;
@@ -264,42 +274,81 @@ bool initSdCard() {
   return true;
 }
 
+void persistPhotoIndex() {
+  if (!littleFsReady) return;
+
+  File f = LittleFS.open(PHOTO_INDEX_FILE, "w");
+  if (!f) return;
+
+  f.write((const uint8_t*)&photoIndex, sizeof(photoIndex));
+  f.close();
+}
+
+bool loadPhotoIndexFromFs() {
+  if (!littleFsReady || !LittleFS.exists(PHOTO_INDEX_FILE)) return false;
+
+  File f = LittleFS.open(PHOTO_INDEX_FILE, "r");
+  if (!f || f.size() < (int)sizeof(photoIndex)) {
+    if (f) f.close();
+    return false;
+  }
+
+  uint16_t saved = 0;
+  if (f.read((uint8_t*)&saved, sizeof(saved)) != sizeof(saved)) {
+    f.close();
+    return false;
+  }
+  f.close();
+
+  if (saved >= MAX_PHOTOS) return false;
+
+  photoIndex = saved;
+  uint16_t prev = (saved == 0) ? (uint16_t)(MAX_PHOTOS - 1) : (uint16_t)(saved - 1);
+  String lastPath = photoPathForIndex(prev);
+  if (SD_MMC.exists(lastPath)) {
+    strncpy(lastPhotoPath, lastPath.c_str(), sizeof(lastPhotoPath) - 1);
+    lastPhotoPath[sizeof(lastPhotoPath) - 1] = '\0';
+    lastCaptureOk = true;
+  }
+  return true;
+}
+
 void restorePhotoIndex() {
   if (!sdReady) return;
 
-  File root = SD_MMC.open(PHOTOS_DIR);
-  if (!root || !root.isDirectory()) {
-    if (root) root.close();
-    photoIndex = 0;
+  Serial.println("[SD] restoring photo index...");
+
+  if (loadPhotoIndexFromFs()) {
+    Serial.printf("[SD] photo index from LittleFS: %u\n", photoIndex);
     return;
   }
 
-  uint16_t maxIndex = 0;
-  File file = root.openNextFile();
-  while (file) {
-    if (!file.isDirectory()) {
-      const char* name = file.name();
-      const char* slash = strrchr(name, '/');
-      const char* base = slash ? slash + 1 : name;
-      unsigned int idx = 0;
-      if (sscanf(base, "%5u.jpg", &idx) == 1 && idx > maxIndex) {
-        maxIndex = (uint16_t)idx;
-      }
-    }
-    file.close();
-    file = root.openNextFile();
-  }
-  root.close();
+  Serial.println("[SD] scanning card (first boot, may take a minute)...");
 
-  photoIndex = (maxIndex + 1) % MAX_PHOTOS;
-  if (maxIndex < MAX_PHOTOS) {
-    String lastPath = photoPathForIndex(maxIndex);
-    if (SD_MMC.exists(lastPath)) {
-      strncpy(lastPhotoPath, lastPath.c_str(), sizeof(lastPhotoPath) - 1);
-      lastPhotoPath[sizeof(lastPhotoPath) - 1] = '\0';
-      lastCaptureOk = true;
+  uint16_t maxIndex = 0;
+  bool found = false;
+  for (uint16_t i = 0; i < MAX_PHOTOS; i++) {
+    if ((i % 200) == 0) {
+      Serial.printf("[SD] scan %u/%u\n", i, MAX_PHOTOS);
+      yield();
+    }
+    if (SD_MMC.exists(photoPathForIndex(i))) {
+      if (i >= maxIndex) maxIndex = i;
+      found = true;
     }
   }
+
+  if (found) {
+    photoIndex = (uint16_t)((maxIndex + 1) % MAX_PHOTOS);
+    String lastPath = photoPathForIndex(maxIndex);
+    strncpy(lastPhotoPath, lastPath.c_str(), sizeof(lastPhotoPath) - 1);
+    lastPhotoPath[sizeof(lastPhotoPath) - 1] = '\0';
+    lastCaptureOk = true;
+  } else {
+    photoIndex = 0;
+  }
+
+  persistPhotoIndex();
   Serial.printf("[SD] photo index restored to %u\n", photoIndex);
 }
 
@@ -345,6 +394,7 @@ bool captureAndSavePhoto() {
   photoIndex = (photoIndex + 1) % MAX_PHOTOS;
   captureCount++;
   lastCaptureOk = true;
+  persistPhotoIndex();
 
   Serial.printf("[Capture] saved %s (%u bytes)\n", lastPhotoPath, (unsigned)written);
   setStatus("Photo saved");
@@ -715,6 +765,17 @@ void publishMqttTelemetry() {
     doc["last_photo"] = lastPhotoPath;
   }
 
+  if (otaInProgress) {
+    doc["ota"] = otaPhase;
+    doc["ota_label"] = otaPhaseLabel(otaPhase);
+    if (otaProgressPct >= 0) doc["progress"] = otaProgressPct;
+    if (otaBytesTotal > 0) {
+      doc["ota_bytes"] = otaBytesDone;
+      doc["ota_total"] = otaBytesTotal;
+    }
+    if (otaErrorMsg[0] != '\0') doc["ota_error"] = otaErrorMsg;
+  }
+
   if (WiFi.status() == WL_CONNECTED) {
     char url[80];
     snprintf(url, sizeof(url), "http://%s/latest.jpg",
@@ -727,18 +788,77 @@ void publishMqttTelemetry() {
   mqttClient.publish(topicTelemetry, buf, n);
 }
 
+const char* otaPhaseLabel(const char* phase) {
+  if (!phase || !phase[0]) return "—";
+  if (strcmp(phase, "preparing") == 0) return "Подготовка";
+  if (strcmp(phase, "connecting") == 0) return "Подключение";
+  if (strcmp(phase, "downloading") == 0) return "Загрузка";
+  if (strcmp(phase, "installing") == 0) return "Запись";
+  if (strcmp(phase, "rebooting") == 0) return "Перезагрузка";
+  if (strcmp(phase, "failed") == 0) return "Ошибка";
+  return phase;
+}
+
+int otaPhaseOrder(const char* phase) {
+  if (!phase) return 0;
+  if (strcmp(phase, "preparing") == 0) return 0;
+  if (strcmp(phase, "connecting") == 0) return 1;
+  if (strcmp(phase, "downloading") == 0) return 2;
+  if (strcmp(phase, "installing") == 0) return 3;
+  if (strcmp(phase, "rebooting") == 0) return 4;
+  if (strcmp(phase, "failed") == 0) return 2;
+  return 0;
+}
+
+String htmlOtaStep(const char* label, int step, int currentStep, bool failed, int failedStep) {
+  const char* cls = "pending";
+  if (failed) {
+    if (step == failedStep) cls = "bad";
+    else if (step < failedStep) cls = "done";
+  } else if (step < currentStep) {
+    cls = "done";
+  } else if (step == currentStep) {
+    cls = "active";
+  }
+
+  String html;
+  html.reserve(64);
+  html += F("<span class=\"ota-step ");
+  html += cls;
+  html += F("\">");
+  html += label;
+  html += F("</span>");
+  return html;
+}
+
 void publishOtaEvent(const char* phase, int progress) {
   if (!mqttClient.connected()) return;
 
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument<512> doc;
   doc["ota"] = phase;
+  doc["ota_label"] = otaPhaseLabel(phase);
   if (progress >= 0) doc["progress"] = progress;
   if (otaBytesTotal > 0) {
     doc["ota_bytes"] = otaBytesDone;
     doc["ota_total"] = otaBytesTotal;
   }
+  if (otaUrl[0] != '\0') doc["ota_url"] = otaUrl;
+  if (otaErrorMsg[0] != '\0') doc["ota_error"] = otaErrorMsg;
+  if (otaFailedPhase[0] != '\0') doc["ota_failed_at"] = otaFailedPhase;
 
-  char buf[256];
+  unsigned long elapsed = (otaStartedMs > 0) ? (millis() - otaStartedMs) : 0;
+  if (elapsed > 0 && otaBytesDone > 0) {
+    doc["ota_elapsed_ms"] = elapsed;
+    doc["ota_speed_bps"] = (otaBytesDone * 1000UL) / elapsed;
+    if (otaBytesTotal > otaBytesDone) {
+      unsigned long speed = (otaBytesDone * 1000UL) / elapsed;
+      if (speed > 0) {
+        doc["ota_eta_sec"] = (otaBytesTotal - otaBytesDone) / speed;
+      }
+    }
+  }
+
+  char buf[512];
   size_t n = serializeJson(doc, buf);
   mqttClient.publish(topicTelemetry, buf, n);
   mqttClient.loop();
@@ -755,11 +875,11 @@ void setOtaProgress(const char* phase, int progress, size_t current, size_t tota
   char status[64];
   if (progress >= 0 && total > 0) {
     snprintf(status, sizeof(status), "OTA %s %d%% (%u/%u KB)",
-             otaPhase, progress, (unsigned)(current / 1024), (unsigned)(total / 1024));
+             otaPhaseLabel(otaPhase), progress, (unsigned)(current / 1024), (unsigned)(total / 1024));
   } else if (progress >= 0) {
-    snprintf(status, sizeof(status), "OTA %s %d%%", otaPhase, progress);
+    snprintf(status, sizeof(status), "OTA %s %d%%", otaPhaseLabel(otaPhase), progress);
   } else {
-    snprintf(status, sizeof(status), "OTA %s", otaPhase);
+    snprintf(status, sizeof(status), "OTA %s", otaPhaseLabel(otaPhase));
   }
   setStatus(status);
 
@@ -778,9 +898,14 @@ void queueOtaUpdate(const char* url) {
 void performOtaUpdate(const char* url) {
   Serial.printf("[OTA] starting: %s (heap=%u)\n", url, ESP.getFreeHeap());
   ensureWebServer();
-  setOtaProgress("starting", 0, 0, 0);
-  publishOtaEvent("starting", 0);
+
+  otaErrorMsg[0] = '\0';
+  otaFailedPhase[0] = '\0';
+  otaStartedMs = millis();
   lastOtaProgress = -1;
+
+  setOtaProgress("preparing", 0, 0, 0);
+  publishOtaEvent("preparing", 0);
 
   if (mqttClient.connected()) {
     mqttClient.disconnect();
@@ -788,6 +913,9 @@ void performOtaUpdate(const char* url) {
   }
   WiFi.setSleep(WIFI_PS_NONE);
   Serial.printf("[OTA] heap after cleanup: %u\n", ESP.getFreeHeap());
+
+  setOtaProgress("connecting", 0, 0, 0);
+  publishOtaEvent("connecting", 0);
 
   httpUpdate.rebootOnUpdate(true);
   httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
@@ -801,11 +929,12 @@ void performOtaUpdate(const char* url) {
 
   httpUpdate.onProgress([](size_t current, size_t total) {
     int pct = (total > 0) ? (int)((current * 100UL) / total) : 0;
-    if (pct >= lastOtaProgress + 5 || pct == 100 || lastOtaProgress < 0) {
+    const char* phase = (pct >= 100) ? "installing" : "downloading";
+    if (pct >= lastOtaProgress + 1 || pct == 100 || lastOtaProgress < 0) {
       lastOtaProgress = pct;
-      Serial.printf("[OTA] %d%% (%u/%u)\n", pct, (unsigned)current, (unsigned)total);
-      setOtaProgress("downloading", pct, current, total);
-      publishOtaEvent("downloading", pct);
+      Serial.printf("[OTA] %s %d%% (%u/%u)\n", phase, pct, (unsigned)current, (unsigned)total);
+      setOtaProgress(phase, pct, current, total);
+      publishOtaEvent(phase, pct);
     }
   });
 
@@ -817,6 +946,10 @@ void performOtaUpdate(const char* url) {
 
   httpUpdate.onError([](int error) {
     Serial.printf("[OTA] error %d: %s\n", error, httpUpdate.getLastErrorString().c_str());
+    strncpy(otaFailedPhase, otaPhase, sizeof(otaFailedPhase) - 1);
+    otaFailedPhase[sizeof(otaFailedPhase) - 1] = '\0';
+    strncpy(otaErrorMsg, httpUpdate.getLastErrorString().c_str(), sizeof(otaErrorMsg) - 1);
+    otaErrorMsg[sizeof(otaErrorMsg) - 1] = '\0';
     setOtaProgress("failed", -1, otaBytesDone, otaBytesTotal);
     publishOtaEvent("failed", -1);
   });
@@ -835,6 +968,12 @@ void performOtaUpdate(const char* url) {
 
   if (ret != HTTP_UPDATE_OK) {
     Serial.printf("[OTA] failed: %s\n", httpUpdate.getLastErrorString().c_str());
+    if (otaFailedPhase[0] == '\0') {
+      strncpy(otaFailedPhase, otaPhase, sizeof(otaFailedPhase) - 1);
+      otaFailedPhase[sizeof(otaFailedPhase) - 1] = '\0';
+    }
+    strncpy(otaErrorMsg, httpUpdate.getLastErrorString().c_str(), sizeof(otaErrorMsg) - 1);
+    otaErrorMsg[sizeof(otaErrorMsg) - 1] = '\0';
     setOtaProgress("failed", -1, otaBytesDone, otaBytesTotal);
     publishOtaEvent("failed", -1);
   }
@@ -895,14 +1034,43 @@ void handlePhotoById() {
   sendJpegFile(path.c_str());
 }
 
+void handleOtaStatus() {
+  StaticJsonDocument<512> doc;
+  doc["in_progress"] = otaInProgress;
+  doc["phase"] = otaPhase;
+  doc["phase_label"] = otaPhaseLabel(otaPhase);
+  if (otaProgressPct >= 0) doc["progress"] = otaProgressPct;
+  if (otaBytesTotal > 0) {
+    doc["bytes"] = otaBytesDone;
+    doc["total"] = otaBytesTotal;
+  }
+  if (otaUrl[0] != '\0') doc["url"] = otaUrl;
+  if (otaErrorMsg[0] != '\0') doc["error"] = otaErrorMsg;
+  if (otaFailedPhase[0] != '\0') doc["failed_at"] = otaFailedPhase;
+
+  unsigned long elapsed = (otaStartedMs > 0) ? (millis() - otaStartedMs) : 0;
+  if (elapsed > 0) doc["elapsed_ms"] = elapsed;
+  if (elapsed > 0 && otaBytesDone > 0) {
+    unsigned long speed = (otaBytesDone * 1000UL) / elapsed;
+    doc["speed_bps"] = speed;
+    if (otaBytesTotal > otaBytesDone && speed > 0) {
+      doc["eta_sec"] = (otaBytesTotal - otaBytesDone) / speed;
+    }
+  }
+
+  String out;
+  serializeJson(doc, out);
+  statusServer.send(200, "application/json; charset=utf-8", out);
+}
+
 void handleStatusPage() {
   String html;
-  html.reserve(5120);
+  html.reserve(6144);
 
   html += F("<!DOCTYPE html><html lang=\"ru\"><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
   if (otaInProgress) {
-    html += F("<meta http-equiv=\"refresh\" content=\"2\">");
+    html += F("<meta http-equiv=\"refresh\" content=\"1\">");
   } else {
     html += F("<meta http-equiv=\"refresh\" content=\"10\">");
   }
@@ -916,45 +1084,80 @@ void handleStatusPage() {
             "table{width:100%;border-collapse:collapse}td{padding:5px 0;border-bottom:1px solid #222836;font-size:.9rem}"
             "td.k{color:#96a0b4;width:44%}.ok{color:#3ecf8e}.bad{color:#ff5c6c}.warn{color:#ffb020}"
             "img.preview{width:100%;max-width:800px;border-radius:8px;background:#000}"
-            ".ota-bar{height:12px;background:#222836;border-radius:6px;overflow:hidden}"
-            ".ota-fill{height:100%;background:linear-gradient(90deg,#2864ff,#3ecf8e);border-radius:6px}"
+            ".ota-steps{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 12px;font-size:.75rem}"
+            ".ota-step{padding:4px 8px;border-radius:999px;background:#222836;color:#7b8499}"
+            ".ota-step.done{background:#1a3d2e;color:#3ecf8e}"
+            ".ota-step.active{background:#2a3f7a;color:#8eb4ff}"
+            ".ota-step.bad{background:#4a1f28;color:#ff5c6c}"
+            ".ota-bar{height:14px;background:#222836;border-radius:7px;overflow:hidden}"
+            ".ota-fill{height:100%;background:linear-gradient(90deg,#2864ff,#3ecf8e);border-radius:7px;transition:width .3s}"
             ".ota-label{font-size:.85rem;color:#c8d0e0;margin:8px 0 0}"
-            ".ota-pct{font-size:1.5rem;font-weight:600;margin:4px 0 8px}"
+            ".ota-pct{font-size:1.75rem;font-weight:600;margin:4px 0 8px}"
+            ".ota-url{font-size:.75rem;color:#7b8499;word-break:break-all;margin-top:8px}"
             "</style></head><body><h1>");
   html += DEVICE_HOSTNAME;
   if (otaInProgress) {
-    html += F("</h1><p class=\"sub\">ESP32-CAM · OTA обновление · автообновление 2 с</p>");
+    html += F("</h1><p class=\"sub\">ESP32-CAM · OTA обновление · автообновление 1 с · <a href=\"/ota.json\" style=\"color:#8eb4ff\">JSON</a></p>");
   } else {
     html += F("</h1><p class=\"sub\">ESP32-CAM · автообновление 10 с</p>");
   }
 
   if (otaInProgress) {
+    bool otaFailed = strcmp(otaPhase, "failed") == 0;
+    int currentStep = otaFailed ? otaPhaseOrder(otaFailedPhase) : otaPhaseOrder(otaPhase);
+    int failedStep = otaFailed ? currentStep : -1;
     int pct = (otaProgressPct >= 0) ? otaProgressPct : 0;
-    const char* phaseClass = (strcmp(otaPhase, "failed") == 0) ? "bad" :
+    const char* phaseClass = otaFailed ? "bad" :
                              (strcmp(otaPhase, "rebooting") == 0) ? "ok" : "warn";
 
-    html += F("<section><h2>OTA обновление</h2>");
-    html += F("<p class=\"ota-pct ");
+    html += F("<section><h2>OTA обновление</h2><div class=\"ota-steps\">");
+    html += htmlOtaStep("Подготовка", 0, currentStep, otaFailed, failedStep);
+    html += htmlOtaStep("Подключение", 1, currentStep, otaFailed, failedStep);
+    html += htmlOtaStep("Загрузка", 2, currentStep, otaFailed, failedStep);
+    html += htmlOtaStep("Запись", 3, currentStep, otaFailed, failedStep);
+    html += htmlOtaStep("Перезагрузка", 4, currentStep, otaFailed, failedStep);
+    html += F("</div><p class=\"ota-pct ");
     html += phaseClass;
     html += F("\">");
     if (otaProgressPct >= 0) {
       html += String(otaProgressPct);
       html += '%';
     } else {
-      html += otaPhase;
+      html += otaPhaseLabel(otaPhase);
     }
     html += F("</p><div class=\"ota-bar\"><div class=\"ota-fill\" style=\"width:");
     html += String(pct);
-    html += F("%\"></div></div><p class=\"ota-label\">");
-    html += otaPhase;
+    html += F("%\"></div></div>");
+
+    html += F("<table style=\"margin-top:12px\">");
+    html += htmlRow("Этап", otaPhaseLabel(otaPhase), phaseClass);
     if (otaBytesTotal > 0) {
-      html += " · ";
-      html += String(otaBytesDone / 1024);
-      html += " / ";
-      html += String(otaBytesTotal / 1024);
-      html += " KB";
+      html += htmlRow("Загружено",
+                      String(otaBytesDone / 1024) + " / " + String(otaBytesTotal / 1024) + " KB (" +
+                      String((otaBytesDone * 100UL) / otaBytesTotal) + "%)");
     }
-    html += F("</p></section>");
+    unsigned long elapsed = (otaStartedMs > 0) ? (millis() - otaStartedMs) : 0;
+    if (elapsed > 1000 && otaBytesDone > 0) {
+      unsigned long speed = (otaBytesDone * 1000UL) / elapsed;
+      html += htmlRow("Скорость", String(speed / 1024) + " KB/s");
+      if (otaBytesTotal > otaBytesDone && speed > 0) {
+        html += htmlRow("Осталось", String((otaBytesTotal - otaBytesDone) / speed) + " с");
+      }
+      html += htmlRow("Прошло", String(elapsed / 1000) + " с");
+    }
+    if (otaFailed && otaFailedPhase[0] != '\0') {
+      html += htmlRow("Сбой на этапе", otaPhaseLabel(otaFailedPhase), "bad");
+    }
+    if (otaErrorMsg[0] != '\0') {
+      html += htmlRow("Ошибка", otaErrorMsg, "bad");
+    }
+    html += F("</table>");
+    if (otaUrl[0] != '\0') {
+      html += F("<p class=\"ota-url\">");
+      html += otaUrl;
+      html += F("</p>");
+    }
+    html += F("</section>");
   }
 
   html += F("<section><h2>Последний кадр</h2>");
@@ -1011,6 +1214,7 @@ void startWebServer() {
   if (webServerStarted) return;
 
   statusServer.on("/", handleStatusPage);
+  statusServer.on("/ota.json", handleOtaStatus);
   statusServer.on("/latest.jpg", handleLatestPhoto);
   statusServer.on("/photo", handlePhotoById);
   statusServer.begin();
