@@ -22,6 +22,13 @@
 // Секреты — вынесены в secrets.h (.gitignore)
 // =====================
 #include "secrets.h"
+#include "firmware_info.h"
+
+// MQTT-топики (DEVICE_HOSTNAME из secrets.h):
+//   devices/<hostname>/status       — online/offline (LWT)
+//   devices/<hostname>/telemetry    — периодическая телеметрия
+//   devices/<hostname>/command      — JSON-команды
+//   devices/<hostname>/capabilities — retained JSON c описанием команд
 
 // =====================
 // Константы железа
@@ -312,7 +319,48 @@ PubSubClient mqttClient(mqttNet);
 char topicStatus[64];
 char topicTelemetry[64];
 char topicCommand[64];
+char topicCapabilities[64];
 bool mqttTopicsReady = false;
+
+const char *CAPABILITIES = R"CAP({
+  "commands": [
+    {
+      "action": "led",
+      "title": "Светодиод",
+      "type": "toggle",
+      "icon": "lightbulb",
+      "description": "Встроенный LED платы (GPIO 2)"
+    },
+    {
+      "action": "status",
+      "title": "HW",
+      "type": "trigger",
+      "icon": "monitor",
+      "description": "Показать страницу HW на OLED"
+    },
+    {
+      "action": "sync",
+      "title": "Синхронизация времени",
+      "type": "trigger",
+      "icon": "clock",
+      "description": "Синхронизация NTP"
+    },
+    {
+      "action": "push",
+      "title": "Отправить в Supabase",
+      "type": "trigger",
+      "icon": "cloud-upload",
+      "description": "Принудительная отправка в Supabase"
+    },
+    {
+      "action": "reboot",
+      "title": "Перезагрузка",
+      "type": "trigger",
+      "icon": "rotate-cw",
+      "description": "ESP.restart()"
+    }
+  ]
+})CAP";
 unsigned long lastMqttTelemetry = 0;
 
 char otaUrl[256] = "";
@@ -390,6 +438,7 @@ void setup() {
 
   delayWithLoadingLed(1000);
   Serial.println("\n--- Уличная метеостанция (Климат 5м / Пыль 30м) ---");
+  logFirmwareInfo("esp32-balcony");
 
   eventLog.init(EVENT_LOG_SIZE);
   errorLog.init(ERROR_LOG_SIZE);
@@ -422,6 +471,8 @@ void setup() {
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
     display.println(F("System Booting..."));
+    display.printf("FW %s\n", FW_VERSION);
+    display.print(FW_BUILD_DATE);
     display.display();
     Serial.println("[OK] OLED SSD1306 инициализирован.");
   } else {
@@ -1064,6 +1115,7 @@ void initMqttTopics() {
   snprintf(topicStatus, sizeof(topicStatus), "devices/%s/status", DEVICE_HOSTNAME);
   snprintf(topicTelemetry, sizeof(topicTelemetry), "devices/%s/telemetry", DEVICE_HOSTNAME);
   snprintf(topicCommand, sizeof(topicCommand), "devices/%s/command", DEVICE_HOSTNAME);
+  snprintf(topicCapabilities, sizeof(topicCapabilities), "devices/%s/capabilities", DEVICE_HOSTNAME);
 
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
   mqttClient.setCallback(handleMqttCommand);
@@ -1286,10 +1338,14 @@ void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
   Serial.printf("[MQTT] action=%s\n", action);
 
   if (strcmp(action, "led") == 0) {
-    if (!doc["value"].is<bool>()) return;
-    bool on = doc["value"];
-    Serial.printf("[MQTT] led %s\n", on ? "on" : "off");
-    setBoardLed(on);
+    if (doc["value"].is<bool>()) {
+      setBoardLed(doc["value"]);
+    } else if (doc["value"].is<int>()) {
+      setBoardLed(doc["value"] != 0);
+    } else {
+      return;
+    }
+    Serial.printf("[MQTT] led %s\n", boardLedOn ? "on" : "off");
     return;
   }
 
@@ -1373,6 +1429,11 @@ void ensureMqtt() {
                          topicStatus, 1, true, "{\"status\":\"offline\"}")) {
     mqttClient.publish(topicStatus, "{\"status\":\"online\"}", true);
     mqttClient.subscribe(topicCommand, 1);
+    if (mqttClient.publish(topicCapabilities, CAPABILITIES, true)) {
+      Serial.printf("[MQTT] capabilities -> %s\n", topicCapabilities);
+    } else {
+      Serial.printf("[MQTT] capabilities publish FAILED (%u bytes)\n", strlen(CAPABILITIES));
+    }
     Serial.println("[MQTT] connected");
     Serial.printf("[MQTT] command  <- %s\n", topicCommand);
     Serial.printf("[MQTT] telemetry -> %s\n", topicTelemetry);
@@ -1401,6 +1462,7 @@ void publishMqttTelemetry() {
   doc["supabase_errors"] = supabaseTotalErrors;
   doc["stale_bme"] = staleBmeCount;
   doc["stale_pms"] = stalePmsCount;
+  addFirmwareTelemetry(doc);
 
   if (hasClimateReading) {
     doc["temperature"] = lastClimateTemp;
@@ -1797,15 +1859,10 @@ void updateOled(uint8_t page) {
       display.printf("Up:  %luh %02lum", upMin / 60, upMin % 60);
 
       display.setCursor(0, 34);
-      display.printf("Heap: %lu  min:%lu",
-                     (unsigned long)ESP.getFreeHeap(),
-                     (unsigned long)sessionMinHeap);
-
-      oledDrawLine(44);
+      display.printf("FW: %s", FW_VERSION);
 
       display.setCursor(0, 48);
-      display.print(F("Boot: "));
-      display.print(bootTimeStr);
+      display.print(FW_BUILD_DATE);
 
       display.setCursor(0, 58);
       display.printf("Rst: %s", rebootReasonShort);

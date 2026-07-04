@@ -3,6 +3,7 @@
 # Использование:
 #   ./scripts/build-ota.sh           — все проекты
 #   ./scripts/build-ota.sh flat      — только esp32_flat_bme280
+#   ./scripts/build-ota.sh lamp      — только esp32_lamp
 #   ./scripts/build-ota.sh balcony cam
 
 set -euo pipefail
@@ -30,11 +31,37 @@ find_arduino_cli() {
 
 ARDUINO_CLI="$(find_arduino_cli)"
 
-# id|sketch_dir|fqbn|build_subdir|ota_filename
+read_fw_version() {
+  local sketch_dir="$1"
+  local info_file="$ROOT/$sketch_dir/firmware_info.h"
+
+  if [[ ! -f "$info_file" ]]; then
+    echo "unknown"
+    return
+  fi
+
+  sed -n 's/^#define FW_VERSION[[:space:]]*"\([^"]*\)".*/\1/p' "$info_file" | head -1
+}
+
+ota_filename() {
+  local base_name="$1"
+  local sketch_dir="$2"
+  local version build_date
+
+  version="$(read_fw_version "$sketch_dir")"
+  [[ -z "$version" ]] && version="unknown"
+  build_date="$(date +%Y%m%d)"
+
+  local stem="${base_name%.bin}"
+  echo "${stem}-${version}-${build_date}.bin"
+}
+
+# id|sketch_dir|fqbn|build_subdir|ota_basename
 PROJECTS=(
   "flat|esp32_flat_bme280|esp32:esp32:esp32:PartitionScheme=default|esp32.esp32.esp32|esp32-flat.bin"
   "balcony|esp32_balcony_pms5003_bme280|esp32:esp32:esp32:PartitionScheme=default|esp32.esp32.esp32|esp32-balcony.bin"
   "cam|esp32_cam|esp32:esp32:esp32cam:PartitionScheme=default|esp32.esp32.esp32cam|esp32-cam.bin"
+  "lamp|esp32_lamp|esp32:esp32:esp32:PartitionScheme=default|esp32.esp32.esp32|esp32-lamp.bin"
 )
 
 should_build() {
@@ -48,20 +75,21 @@ should_build() {
 }
 
 build_project() {
-  local id sketch_dir fqbn build_subdir ota_name
-  IFS='|' read -r id sketch_dir fqbn build_subdir ota_name <<<"$1"
+  local id sketch_dir fqbn build_subdir ota_basename
+  IFS='|' read -r id sketch_dir fqbn build_subdir ota_basename <<<"$1"
 
   local sketch="$ROOT/$sketch_dir"
   local build_path="$sketch/build/$build_subdir"
-  local ino_name
+  local ino_name ota_name
   ino_name="$(basename "$sketch_dir").ino"
+  ota_name="$(ota_filename "$ota_basename" "$sketch_dir")"
 
   if [[ ! -f "$sketch/secrets.h" ]]; then
     echo "[$id] пропуск: нет $sketch/secrets.h (скопируйте secrets.example.h)" >&2
     return 1
   fi
 
-  echo "[$id] компиляция..."
+  echo "[$id] компиляция ($(read_fw_version "$sketch_dir"), $(date +%Y-%m-%d))..."
   "$ARDUINO_CLI" compile \
     --fqbn "$fqbn" \
     --build-path "$build_path" \
@@ -106,7 +134,7 @@ main() {
   done
 
   if [[ $built -eq 0 ]]; then
-    echo "Ничего не собрано. Доступные цели: flat, balcony, cam" >&2
+    echo "Ничего не собрано. Доступные цели: flat, balcony, cam, lamp" >&2
     exit 1
   fi
 

@@ -13,6 +13,13 @@
 #include "SD_MMC.h"
 
 #include "secrets.h"
+#include "firmware_info.h"
+
+// MQTT-топики (DEVICE_HOSTNAME из secrets.h):
+//   devices/<hostname>/status       — online/offline (LWT)
+//   devices/<hostname>/telemetry    — периодическая телеметрия
+//   devices/<hostname>/command      — JSON-команды
+//   devices/<hostname>/capabilities — retained JSON c описанием команд
 
 // =====================
 // AI-Thinker ESP32-CAM pins
@@ -62,7 +69,34 @@ WebServer statusServer(80);
 char topicStatus[64];
 char topicTelemetry[64];
 char topicCommand[64];
+char topicCapabilities[64];
 bool mqttTopicsReady = false;
+
+const char *CAPABILITIES = R"CAP({
+  "commands": [
+    {
+      "action": "led",
+      "title": "Вспышка",
+      "type": "toggle",
+      "icon": "zap",
+      "description": "LED вспышки камеры (GPIO4)"
+    },
+    {
+      "action": "capture",
+      "title": "Снимок",
+      "type": "trigger",
+      "icon": "camera",
+      "description": "Сделать снимок сейчас"
+    },
+    {
+      "action": "reboot",
+      "title": "Перезагрузка",
+      "type": "trigger",
+      "icon": "rotate-cw",
+      "description": "ESP.restart()"
+    }
+  ]
+})CAP";
 bool webServerStarted = false;
 
 bool cameraReady = false;
@@ -451,6 +485,7 @@ void initMqttTopics() {
   snprintf(topicStatus, sizeof(topicStatus), "devices/%s/status", DEVICE_HOSTNAME);
   snprintf(topicTelemetry, sizeof(topicTelemetry), "devices/%s/telemetry", DEVICE_HOSTNAME);
   snprintf(topicCommand, sizeof(topicCommand), "devices/%s/command", DEVICE_HOSTNAME);
+  snprintf(topicCapabilities, sizeof(topicCapabilities), "devices/%s/capabilities", DEVICE_HOSTNAME);
 
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
   mqttClient.setCallback(handleMqttCommand);
@@ -662,10 +697,14 @@ void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
   Serial.printf("[MQTT] action=%s\n", action);
 
   if (strcmp(action, "led") == 0) {
-    if (!doc["value"].is<bool>()) return;
-    bool on = doc["value"];
-    Serial.printf("[MQTT] led %s\n", on ? "on" : "off");
-    setFlashLed(on);
+    if (doc["value"].is<bool>()) {
+      setFlashLed(doc["value"]);
+    } else if (doc["value"].is<int>()) {
+      setFlashLed(doc["value"] != 0);
+    } else {
+      return;
+    }
+    Serial.printf("[MQTT] led %s\n", flashLedOn ? "on" : "off");
     return;
   }
 
@@ -736,6 +775,11 @@ void ensureMqtt() {
                          topicStatus, 1, true, "{\"status\":\"offline\"}")) {
     mqttClient.publish(topicStatus, "{\"status\":\"online\"}", true);
     mqttClient.subscribe(topicCommand, 1);
+    if (mqttClient.publish(topicCapabilities, CAPABILITIES, true)) {
+      Serial.printf("[MQTT] capabilities -> %s\n", topicCapabilities);
+    } else {
+      Serial.printf("[MQTT] capabilities publish FAILED (%u bytes)\n", strlen(CAPABILITIES));
+    }
     Serial.println("[MQTT] connected");
     Serial.printf("[MQTT] command  <- %s\n", topicCommand);
     Serial.printf("[MQTT] telemetry -> %s\n", topicTelemetry);
@@ -760,6 +804,7 @@ void publishMqttTelemetry() {
   doc["capture_count"] = captureCount;
   doc["last_capture_ok"] = lastCaptureOk;
   doc["capture_errors"] = captureErrors;
+  addFirmwareTelemetry(doc);
 
   if (lastPhotoPath[0] != '\0') {
     doc["last_photo"] = lastPhotoPath;
@@ -1203,6 +1248,8 @@ void handleStatusPage() {
   html += F("</table></section>");
 
   html += F("<section><h2>Система</h2><table>");
+  html += htmlRow("FW", FW_VERSION);
+  html += htmlRow("Сборка", String(FW_BUILD_DATE) + " " + FW_BUILD_TIME);
   html += htmlRow("Heap", String(ESP.getFreeHeap()) + " B");
   html += htmlRow("Вспышка", flashLedOn ? "Вкл" : "Выкл");
   html += F("</table></section></body></html>");
@@ -1239,6 +1286,7 @@ void setup() {
 
   Serial.println();
   Serial.println("ESP32-CAM photo station");
+  logFirmwareInfo("esp32-cam");
 
   pinMode(LED_FLASH_PIN, OUTPUT);
   setFlashLed(false);

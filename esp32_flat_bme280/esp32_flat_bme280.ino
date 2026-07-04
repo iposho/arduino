@@ -18,6 +18,13 @@
 // Секреты — вынесены в secrets.h (.gitignore)
 // =====================
 #include "secrets.h"
+#include "firmware_info.h"
+
+// MQTT-топики (DEVICE_HOSTNAME из secrets.h):
+//   devices/<hostname>/status       — online/offline (LWT)
+//   devices/<hostname>/telemetry    — периодическая телеметрия
+//   devices/<hostname>/command      — JSON-команды
+//   devices/<hostname>/capabilities — retained JSON c описанием команд
 
 // =====================
 // TFT SPI pins
@@ -184,7 +191,41 @@ PubSubClient mqttClient(mqttNet);
 char topicStatus[64];
 char topicTelemetry[64];
 char topicCommand[64];
+char topicCapabilities[64];
 bool mqttTopicsReady = false;
+
+const char *CAPABILITIES = R"CAP({
+  "commands": [
+    {
+      "action": "led",
+      "title": "Светодиод",
+      "type": "toggle",
+      "icon": "lightbulb",
+      "description": "Встроенный светодиод на GPIO (LED_BUILTIN)"
+    },
+    {
+      "action": "status",
+      "title": "System info",
+      "type": "trigger",
+      "icon": "info",
+      "description": "Показать экран System info"
+    },
+    {
+      "action": "refresh",
+      "title": "Обновить улицу",
+      "type": "trigger",
+      "icon": "refresh-cw",
+      "description": "Принудительно обновить данные с балкона"
+    },
+    {
+      "action": "reboot",
+      "title": "Перезагрузка",
+      "type": "trigger",
+      "icon": "rotate-cw",
+      "description": "ESP.restart()"
+    }
+  ]
+})CAP";
 unsigned long lastMqttTelemetry = 0;
 
 char otaUrl[256] = "";
@@ -371,6 +412,7 @@ void initMqttTopics() {
   snprintf(topicStatus, sizeof(topicStatus), "devices/%s/status", DEVICE_HOSTNAME);
   snprintf(topicTelemetry, sizeof(topicTelemetry), "devices/%s/telemetry", DEVICE_HOSTNAME);
   snprintf(topicCommand, sizeof(topicCommand), "devices/%s/command", DEVICE_HOSTNAME);
+  snprintf(topicCapabilities, sizeof(topicCapabilities), "devices/%s/capabilities", DEVICE_HOSTNAME);
 
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
   mqttClient.setCallback(handleMqttCommand);
@@ -647,10 +689,14 @@ void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
   Serial.printf("[MQTT] action=%s\n", action);
 
   if (strcmp(action, "led") == 0) {
-    if (!doc["value"].is<bool>()) return;
-    bool on = doc["value"];
-    Serial.printf("[MQTT] led %s\n", on ? "on" : "off");
-    setBoardLed(on);
+    if (doc["value"].is<bool>()) {
+      setBoardLed(doc["value"]);
+    } else if (doc["value"].is<int>()) {
+      setBoardLed(doc["value"] != 0);
+    } else {
+      return;
+    }
+    Serial.printf("[MQTT] led %s\n", boardLedOn ? "on" : "off");
     return;
   }
 
@@ -773,6 +819,11 @@ void ensureMqtt() {
                          topicStatus, 1, true, "{\"status\":\"offline\"}")) {
     mqttClient.publish(topicStatus, "{\"status\":\"online\"}", true);
     mqttClient.subscribe(topicCommand, 1);
+    if (mqttClient.publish(topicCapabilities, CAPABILITIES, true)) {
+      Serial.printf("[MQTT] capabilities -> %s\n", topicCapabilities);
+    } else {
+      Serial.printf("[MQTT] capabilities publish FAILED (%u bytes)\n", strlen(CAPABILITIES));
+    }
     Serial.println("[MQTT] connected");
     Serial.printf("[MQTT] command  <- %s\n", topicCommand);
     Serial.printf("[MQTT] telemetry -> %s\n", topicTelemetry);
@@ -793,6 +844,7 @@ void publishMqttTelemetry() {
   doc["led"] = boardLedOn;
   doc["screen"] = (int)currentScreen + 1;
   doc["overlay"] = showingTimeScreen ? "time" : (showingInfoScreen ? "status" : "");
+  addFirmwareTelemetry(doc);
 
   if (bmeReady) {
     float t = (filteredTemp > -900) ? filteredTemp : bme.readTemperature();
@@ -1322,7 +1374,7 @@ void drawAqiScreen() {
 void drawInfoScreen() {
   tft.fillScreen(COLOR_BG);
   drawHeader("System info", COLOR_GREEN);
-  drawCard(6, 30, 148, 84, "STATUS", COLOR_GREEN);
+  drawCard(6, 30, 148, 54, "STATUS", COLOR_GREEN);
 
   tft.setTextSize(1);
 
@@ -1353,6 +1405,20 @@ void drawInfoScreen() {
   tft.setTextColor(aqiDataValid ? COLOR_GREEN : COLOR_RED);
   tft.setCursor(70, 96);
   tft.print(aqiDataValid ? "ready" : "error");
+
+  drawCard(6, 88, 148, 24, "FIRMWARE", COLOR_CYAN);
+  tft.setTextColor(COLOR_MUTED);
+  tft.setCursor(14, 96);
+  tft.print("Version");
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(70, 96);
+  tft.print(FW_VERSION);
+  tft.setTextColor(COLOR_MUTED);
+  tft.setCursor(14, 106);
+  tft.print("Build");
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(70, 106);
+  tft.print(FW_BUILD_DATE);
 
   drawStatusBar();
 }
@@ -1536,6 +1602,7 @@ void setup() {
 
   Serial.println();
   Serial.println("ESP32 TFT Climate Station");
+  logFirmwareInfo("esp32-flat");
 
   pinMode(JOY_SW_PIN, INPUT_PULLUP);
   pinMode(JOY_X_PIN, INPUT);

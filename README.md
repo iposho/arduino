@@ -12,6 +12,7 @@ flowchart LR
     B[esp32-balcony]
     F[esp32-flat]
     C[esp32-cam]
+    L[esp32-lamp]
   end
 
   subgraph hub [Шлюз]
@@ -25,6 +26,7 @@ flowchart LR
   B --> M
   F --> M
   C --> M
+  L --> M
   B --> S
   F --> S
   C -->|HTTP локально| U[Браузер / LAN]
@@ -35,6 +37,7 @@ flowchart LR
 | `devices/<hostname>/status` | Online/offline (LWT) |
 | `devices/<hostname>/telemetry` | Периодическая телеметрия (каждые 10 с) |
 | `devices/<hostname>/command` | JSON-команды на устройство |
+| `devices/<hostname>/capabilities` | Retained JSON с описанием команд (для админки) |
 
 Общий формат команды: `{"action": "...", "value": ...}` (поле `value` — только где нужно).
 
@@ -186,6 +189,49 @@ AI-Thinker ESP32-CAM + microSD.
 
 **Прошивка:** Board = **AI Thinker ESP32-CAM**, Partition = **Default** (4MB with spiffs, OTA). microSD — **FAT32**.
 
+---
+
+### 4. esp32_lamp — Управление светом
+
+ESP32 DevKit + LED-лампа на **2 провода** (красный/чёрный).
+
+**Подключение:**
+
+| Лампа | ESP32 |
+|-------|-------|
+| + (красный) | **GPIO 13** |
+| − (чёрный) | **GND** |
+
+Если лампа слишком яркая или греет GPIO — резистор **100–330 Ω** между GPIO 13 и «+».
+
+> Не вешайте на VIN/GND — с двумя проводами это только постоянное питание, без управления.
+
+- **MQTT** — телеметрия и команды на шлюз
+- OTA-обновление прошивки
+- Автопереподключение Wi-Fi
+
+**MQTT-команды:**
+
+| action | Описание |
+|--------|----------|
+| `light` или `lamp` + `value: bool/int` | Включить/выключить лампу (GPIO 13) |
+| `pin_write` + `pin: 13`, `value: 0/1` | То же через GPIO (как на других устройствах) |
+| `pin_read` + `pin: N` | Прочитать пин, ответ в telemetry |
+| `pin_mode` + `pin`, `mode` | `OUTPUT` / `INPUT` / `INPUT_PULLUP` |
+| `led` + `value: bool` | Встроенный LED платы (GPIO 2) |
+| `reboot` | Перезагрузка |
+| `ota` + `url: string` | OTA-обновление прошивки по HTTP(S) |
+
+**Пины:**
+
+| Компонент | GPIO |
+|-----------|------|
+| Лампа + | 13 |
+| Лампа − | GND |
+| LED встроенный | 2 |
+
+**Плата:** ESP32 Dev Module, Partition = **Default** (4MB with spiffs, OTA).
+
 ## Настройка
 
 ### 1. Секреты
@@ -197,20 +243,21 @@ AI-Thinker ESP32-CAM + microSD.
 | esp32_balcony | ✓ | ✓ | ✓ |
 | esp32_flat | ✓ | ✓ | ✓ |
 | esp32_cam | ✓ | ✓ | — |
+| esp32_lamp | ✓ | ✓ | — |
 
 `DEVICE_HOSTNAME` используется как имя в роутере и как MQTT device id.
 
 ### 2. Библиотеки (Arduino Library Manager)
 
-| Библиотека | Балкон | Комната | Камера |
-|------------|:------:|:-------:|:------:|
-| Adafruit BME280 Library | ✓ | ✓ | |
-| Adafruit GFX Library | ✓ | ✓ | |
-| Adafruit SSD1306 | ✓ | | |
-| Adafruit ST7735 and ST7789 Library | | ✓ | |
-| PMS Library | ✓ | | |
-| ArduinoJson | ✓ | ✓ | ✓ |
-| PubSubClient | ✓ | ✓ | ✓ |
+| Библиотека | Балкон | Комната | Камера | Лампа |
+|------------|:------:|:-------:|:------:|:-----:|
+| Adafruit BME280 Library | ✓ | ✓ | | |
+| Adafruit GFX Library | ✓ | ✓ | | |
+| Adafruit SSD1306 | ✓ | | | |
+| Adafruit ST7735 and ST7789 Library | | ✓ | | |
+| PMS Library | ✓ | | | |
+| ArduinoJson | ✓ | ✓ | ✓ | ✓ |
+| PubSubClient | ✓ | ✓ | ✓ | ✓ |
 
 Камера использует встроенные `esp_camera` и `SD_MMC` (ESP32 Arduino core).
 
@@ -224,7 +271,7 @@ AI-Thinker ESP32-CAM + microSD.
 
 **OTA (по MQTT):**
 
-Все три устройства поддерживают удалённое обновление через HTTP(S). Команда на топик `devices/<hostname>/command`:
+Все устройства поддерживают удалённое обновление через HTTP(S). Команда на топик `devices/<hostname>/command`:
 
 ```json
 {"action": "ota", "url": "https://example.com/ota/esp32-flat.bin"}
@@ -236,13 +283,14 @@ AI-Thinker ESP32-CAM + microSD.
 
 ### 4. Сборка OTA-бинарников
 
-Скрипт `scripts/build-ota.sh` собирает прошивки через `arduino-cli` (из PATH или из Arduino IDE) и кладёт готовые `.bin` в `ota/`:
+Скрипт `scripts/build-ota.sh` собирает прошивки через `arduino-cli` (из PATH или из Arduino IDE) и кладёт готовые `.bin` в `ota/`. Имя файла: `<устройство>-<версия>-<дата>.bin` (версия из `firmware_info.h`, дата — день сборки).
 
-| Цель | Плата | Partition | Файл |
-|------|-------|-----------|------|
-| `flat` | ESP32 Dev Module | Default | `ota/esp32-flat.bin` |
-| `balcony` | ESP32 Dev Module | Default | `ota/esp32-balcony.bin` |
-| `cam` | AI Thinker ESP32-CAM | Default | `ota/esp32-cam.bin` |
+| Цель | Плата | Partition | Пример файла |
+|------|-------|-----------|--------------|
+| `flat` | ESP32 Dev Module | Default | `ota/esp32-flat-1.1.0-20260704.bin` |
+| `balcony` | ESP32 Dev Module | Default | `ota/esp32-balcony-1.1.0-20260704.bin` |
+| `cam` | AI Thinker ESP32-CAM | Default | `ota/esp32-cam-1.1.0-20260704.bin` |
+| `lamp` | ESP32 Dev Module | Default | `ota/esp32-lamp-1.1.0-20260704.bin` |
 
 ```bash
 ./scripts/build-ota.sh              # все проекты
@@ -275,6 +323,11 @@ arduino/
 │   └── secrets.example.h
 ├── esp32_cam/                      # ESP32-CAM, фото на SD
 │   ├── esp32_cam.ino
+│   ├── build/                      # (.gitignore)
+│   ├── secrets.h                   # (.gitignore)
+│   └── secrets.example.h
+├── esp32_lamp/                     # Управление светом по MQTT
+│   ├── esp32_lamp.ino
 │   ├── build/                      # (.gitignore)
 │   ├── secrets.h                   # (.gitignore)
 │   └── secrets.example.h
