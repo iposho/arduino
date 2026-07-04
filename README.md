@@ -187,7 +187,9 @@ AI-Thinker ESP32-CAM + microSD.
 | microSD (1-bit) | CLK 14, CMD 15, D0 2 |
 | Вспышка | 4 |
 
-**Прошивка:** Board = **AI Thinker ESP32-CAM**, Partition = **Default** (4MB with spiffs, OTA). microSD — **FAT32**.
+**Прошивка:** Board = **AI Thinker ESP32-CAM**, Partition = **Minimal SPIFFS (1.9MB APP with OTA/128KB SPIFFS)**. microSD — **FAT32**.
+
+> У ESP32-CAM в Arduino IDE по умолчанию стоит **Huge APP** — OTA там не работает. Прошивка камеры ~1.3 МБ, поэтому обычный Default (слот 1.2 МБ) тоже не подходит — нужен именно **min_spiffs**.
 
 ---
 
@@ -289,7 +291,7 @@ ESP32 DevKit + LED-лампа на **2 провода** (красный/чёрн
 |------|-------|-----------|--------------|
 | `flat` | ESP32 Dev Module | Default | `ota/esp32-flat-1.1.0-20260704.bin` |
 | `balcony` | ESP32 Dev Module | Default | `ota/esp32-balcony-1.1.0-20260704.bin` |
-| `cam` | AI Thinker ESP32-CAM | Default | `ota/esp32-cam-1.1.0-20260704.bin` |
+| `cam` | AI Thinker ESP32-CAM | min_spiffs | `ota/esp32-cam-1.1.0-20260704.bin` |
 | `lamp` | ESP32 Dev Module | Default | `ota/esp32-lamp-1.1.0-20260704.bin` |
 
 ```bash

@@ -60,7 +60,7 @@ ota_filename() {
 PROJECTS=(
   "flat|esp32_flat_bme280|esp32:esp32:esp32:PartitionScheme=default|esp32.esp32.esp32|esp32-flat.bin"
   "balcony|esp32_balcony_pms5003_bme280|esp32:esp32:esp32:PartitionScheme=default|esp32.esp32.esp32|esp32-balcony.bin"
-  "cam|esp32_cam|esp32:esp32:esp32cam:PartitionScheme=default|esp32.esp32.esp32cam|esp32-cam.bin"
+  "cam|esp32_cam|esp32:esp32:esp32cam:PartitionScheme=min_spiffs|esp32.esp32.esp32cam|esp32-cam.bin"
   "lamp|esp32_lamp|esp32:esp32:esp32:PartitionScheme=default|esp32.esp32.esp32|esp32-lamp.bin"
 )
 

@@ -78,7 +78,8 @@
 #define OLED_PAGE_MS       5000UL
 #define OLED_STATUS_HOLD_MS 5000UL
 
-// Встроенный LED на ESP32 DevKit (GPIO 2, active LOW) — отдельно от светофора R/Y/G
+// Встроенный LED на ESP32 DevKit (GPIO 2, active LOW) — отдельно от светофора R/Y/G.
+// По умолчанию выкл; включается только командой led (индикация загрузки — кратко, потом off).
 #ifndef LED_BUILTIN
 #define LED_BUILTIN 2
 #endif
@@ -430,6 +431,9 @@ void    setupHttpClient(HTTPClient &http);
 // SETUP
 // ============================================================
 void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
+  setBoardLed(false);
+
   Serial.begin(115200);
 
   pinMode(LED_R, OUTPUT);
@@ -446,9 +450,6 @@ void setup() {
   esp_reset_reason_t rstReason = esp_reset_reason();
   if (rstReason != ESP_RST_SW) rtcRebootMagic = 0;
   sessionMinHeap = ESP.getFreeHeap();
-
-  pinMode(LED_BUILTIN, OUTPUT);
-  setBoardLed(false);
 
   littleFsReady = LittleFS.begin(true, "/littlefs", 10, "spiffs");
   if (!littleFsReady) {
@@ -1450,7 +1451,6 @@ void publishMqttTelemetry() {
 
   StaticJsonDocument<512> doc;
   doc["uptime"] = millis() / 1000UL;
-  doc["rssi"] = WiFi.RSSI();
   doc["heap"] = ESP.getFreeHeap();
   doc["min_heap"] = sessionMinHeap;
   doc["bme_ready"] = bmeReady;
@@ -1462,6 +1462,7 @@ void publishMqttTelemetry() {
   doc["supabase_errors"] = supabaseTotalErrors;
   doc["stale_bme"] = staleBmeCount;
   doc["stale_pms"] = stalePmsCount;
+  addNetworkTelemetry(doc);
   addFirmwareTelemetry(doc);
 
   if (hasClimateReading) {

@@ -1,3 +1,19 @@
+/*
+ * ESP32 boilerplate для шлюза esp32.kuzyak.in
+ *
+ * Библиотеки (Arduino Library Manager): PubSubClient, ArduinoJson
+ *
+ * Скопируйте папку, переименуйте, заполните secrets.h из secrets.example.h.
+ *
+ * MQTT-топики (DEVICE_HOSTNAME из secrets.h):
+ *   devices/<hostname>/status        — online/offline (LWT)
+ *   devices/<hostname>/telemetry     — периодическая телеметрия
+ *   devices/<hostname>/capabilities  — retained JSON с commands[] для Node-RED
+ *   devices/<hostname>/command       — входящие JSON-команды
+ *
+ * Команды из коробки: led, reboot, ota, pin_mode, pin_write, pin_read
+ * Добавляйте свои action в handleMqttCommand() и в CAPABILITIES.
+ */
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
@@ -8,35 +24,41 @@
 #include "secrets.h"
 #include "firmware_info.h"
 
-// MQTT-топики (DEVICE_HOSTNAME из secrets.h):
-//   devices/<hostname>/status       — online/offline (LWT)
-//   devices/<hostname>/telemetry    — периодическая телеметрия
-//   devices/<hostname>/command      — JSON-команды
-//   devices/<hostname>/capabilities — retained JSON c описанием команд
+// =====================
+// Конфигурация
+// =====================
+#define DEVICE_LABEL "esp32-template"
 
-// =====================
-// Пины
-// =====================
 // Встроенный LED DevKit (GPIO 2, active LOW). По умолчанию выкл;
 // включается только командой led/pin_write (индикация загрузки — кратко, потом off).
 #ifndef LED_BUILTIN
 #define LED_BUILTIN 2
 #endif
 
-// LED-лампа на 2 провода (+/−), транзистор/резистор внутри корпуса.
-// Подключение:
-//   (+) красный  → GPIO 13  (можно через резистор 100–330 Ω, если ярко/греется)
-//   (−) чёрный   → GND
-// HIGH на GPIO 13 = вкл, LOW = выкл.
-// Не подключайте к VIN — иначе всегда горит и GPIO не управляет.
-#define LAMP_PIN         13
-#define LAMP_ACTIVE_LOW  false
-
-// =====================
-// Intervals
-// =====================
 const unsigned long MQTT_TELEMETRY_INTERVAL = 10UL * 1000UL;
 const unsigned long WIFI_RETRY_INTERVAL     = 30UL * 1000UL;
+
+// =====================
+// MQTT capabilities (retained)
+// =====================
+const char *CAPABILITIES = R"CAP({
+  "commands": [
+    {
+      "action": "led",
+      "title": "Светодиод",
+      "type": "toggle",
+      "icon": "lightbulb",
+      "description": "Встроенный светодиод на GPIO (LED_BUILTIN)"
+    },
+    {
+      "action": "reboot",
+      "title": "Перезагрузка",
+      "type": "trigger",
+      "icon": "rotate-cw",
+      "description": "ESP.restart()"
+    }
+  ]
+})CAP";
 
 // =====================
 // State
@@ -50,35 +72,7 @@ char topicCommand[64];
 char topicCapabilities[64];
 bool mqttTopicsReady = false;
 
-const char *CAPABILITIES = R"CAP({
-  "commands": [
-    {
-      "action": "light",
-      "title": "Лампа GPIO13",
-      "type": "toggle",
-      "icon": "lightbulb",
-      "description": "Вкл/выкл лампу на GPIO13 (+/−)"
-    },
-    {
-      "action": "led",
-      "title": "Светодиод",
-      "type": "toggle",
-      "icon": "circle",
-      "description": "Встроенный светодиод на GPIO (LED_BUILTIN)"
-    },
-    {
-      "action": "reboot",
-      "title": "Перезагрузка",
-      "type": "trigger",
-      "icon": "rotate-cw",
-      "description": "ESP.restart()"
-    }
-  ]
-})CAP";
-
 bool boardLedOn = false;
-bool lampOn = false;
-
 char statusLine[64] = "Booting";
 
 unsigned long lastMqttTelemetry = 0;
@@ -93,7 +87,6 @@ int lastOtaProgress = -1;
 // =====================
 void setStatus(const char* msg);
 void setBoardLed(bool on);
-void setLamp(bool on);
 void connectWiFi();
 void initMqttTopics();
 void ensureMqtt();
@@ -102,14 +95,17 @@ void publishOtaEvent(const char* phase, int progress = -1);
 void queueOtaUpdate(const char* url);
 void performOtaUpdate(const char* url);
 void handleMqttCommand(char* topic, byte* payload, unsigned int length);
+bool handleCustomMqttAction(const char* action, JsonDocument& doc);
 bool isGpioPinAllowed(uint8_t pin);
 bool isPinOutputCapable(uint8_t pin);
 bool applyPinMode(uint8_t pin, const char* mode);
 void publishPinRead(uint8_t pin);
 void handlePinWrite(uint8_t pin, int value);
+void setupDevice();
+void loopDevice();
 
 // =====================
-// Helpers
+// Logging / status
 // =====================
 void setStatus(const char* msg) {
   strncpy(statusLine, msg, sizeof(statusLine) - 1);
@@ -122,16 +118,13 @@ void setBoardLed(bool on) {
   digitalWrite(LED_BUILTIN, on ? LOW : HIGH);
 }
 
-void setLamp(bool on) {
-  lampOn = on;
-  bool level = LAMP_ACTIVE_LOW ? !on : on;
-  digitalWrite(LAMP_PIN, level ? HIGH : LOW);
-  Serial.printf("[Lamp] %s\n", on ? "ON" : "OFF");
-}
-
+// =====================
+// GPIO helpers
+// =====================
 bool isGpioPinAllowed(uint8_t pin) {
   if (pin > 39) return false;
   if (pin >= 6 && pin <= 11) return false;  // flash
+  if (pin == LED_BUILTIN) return true;
   return true;
 }
 
@@ -184,9 +177,7 @@ void handlePinWrite(uint8_t pin, int value) {
 
   if (value <= 1) {
     if (!isPinOutputCapable(pin)) return;
-    if (pin == LAMP_PIN) {
-      setLamp(value != 0);
-    } else if (pin == LED_BUILTIN) {
+    if (pin == LED_BUILTIN) {
       setBoardLed(value != 0);
     } else {
       pinMode(pin, OUTPUT);
@@ -211,7 +202,7 @@ void connectWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(DEVICE_HOSTNAME);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("WiFi connecting");
+  Serial.print("[WiFi] connecting");
 
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 20) {
@@ -221,9 +212,7 @@ void connectWiFi() {
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println(" OK");
-    Serial.print("IP: ");
-    Serial.println(WiFi.localIP());
+    Serial.printf(" OK %s\n", WiFi.localIP().toString().c_str());
     setStatus("WiFi connected");
   } else {
     Serial.println(" FAILED");
@@ -248,6 +237,13 @@ void initMqttTopics() {
   mqttTopicsReady = true;
 }
 
+bool handleCustomMqttAction(const char* action, JsonDocument& doc) {
+  (void)action;
+  (void)doc;
+  // Добавьте свои action здесь. Верните true, если обработали.
+  return false;
+}
+
 void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
   Serial.printf("[MQTT] << %s (%u): %.*s\n", topic, length, length, payload);
 
@@ -264,12 +260,7 @@ void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
   }
   Serial.printf("[MQTT] action=%s\n", action);
 
-  if (strcmp(action, "light") == 0 || strcmp(action, "lamp") == 0 || strcmp(action, "relay") == 0) {
-    if (doc["value"].is<bool>()) {
-      setLamp(doc["value"]);
-    } else if (doc["value"].is<int>()) {
-      setLamp(doc["value"] != 0);
-    }
+  if (handleCustomMqttAction(action, doc)) {
     return;
   }
 
@@ -367,10 +358,13 @@ void publishMqttTelemetry() {
   StaticJsonDocument<384> doc;
   doc["uptime"] = millis() / 1000UL;
   doc["heap"] = ESP.getFreeHeap();
-  doc["light"] = lampOn;
   doc["led"] = boardLedOn;
+  doc["status"] = statusLine;
   addNetworkTelemetry(doc);
   addFirmwareTelemetry(doc);
+
+  // Добавьте свои метрики:
+  // doc["temperature"] = 23.5;
 
   char buf[384];
   size_t n = serializeJson(doc, buf);
@@ -456,20 +450,31 @@ void performOtaUpdate(const char* url) {
 }
 
 // =====================
+// Device hooks — переопределите в своём скетче при необходимости
+// =====================
+void setupDevice() {
+  // Инициализация датчиков, пинов, дисплеев и т.д.
+}
+
+void loopDevice() {
+  // Периодическая логика устройства (опрос датчиков и т.д.)
+}
+
+// =====================
 // Setup / loop
 // =====================
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
-  pinMode(LAMP_PIN, OUTPUT);
   setBoardLed(false);
-  setLamp(false);
 
   Serial.begin(115200);
   delay(500);
 
   Serial.println();
-  Serial.println("ESP32 Lamp Controller");
-  logFirmwareInfo("esp32-lamp");
+  logFirmwareInfo(DEVICE_LABEL);
+  setStatus("Booting");
+
+  setupDevice();
 
   connectWiFi();
   ensureMqtt();
@@ -498,6 +503,8 @@ void loop() {
       publishMqttTelemetry();
     }
   }
+
+  loopDevice();
 
   delay(50);
 }

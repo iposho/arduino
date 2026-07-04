@@ -7,6 +7,7 @@
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 #include <time.h>
+#include <esp_ota_ops.h>
 
 #include "esp_camera.h"
 #include "FS.h"
@@ -24,6 +25,7 @@
 // =====================
 // AI-Thinker ESP32-CAM pins
 // =====================
+// LED вспышки (GPIO4). По умолчанию выкл; включается только командой led.
 #define LED_FLASH_PIN 4
 
 #define PWDN_GPIO_NUM     32
@@ -148,6 +150,9 @@ void publishMqttTelemetry();
 void publishOtaEvent(const char* phase, int progress = -1);
 void setOtaProgress(const char* phase, int progress, size_t current = 0, size_t total = 0);
 void queueOtaUpdate(const char* url);
+void releaseResourcesForOta();
+bool otaUpdateAvailable(size_t* slotSizeOut = nullptr);
+void logPartitionInfo();
 void performOtaUpdate(const char* url);
 bool isFsPathValid(const char* path);
 void publishFsTelemetry(JsonDocument& doc);
@@ -794,7 +799,6 @@ void publishMqttTelemetry() {
 
   StaticJsonDocument<512> doc;
   doc["uptime"] = millis() / 1000UL;
-  doc["rssi"] = WiFi.RSSI();
   doc["heap"] = ESP.getFreeHeap();
   doc["camera_ready"] = cameraReady;
   doc["sd_ready"] = sdReady;
@@ -804,6 +808,7 @@ void publishMqttTelemetry() {
   doc["capture_count"] = captureCount;
   doc["last_capture_ok"] = lastCaptureOk;
   doc["capture_errors"] = captureErrors;
+  addNetworkTelemetry(doc);
   addFirmwareTelemetry(doc);
 
   if (lastPhotoPath[0] != '\0') {
@@ -940,6 +945,33 @@ void queueOtaUpdate(const char* url) {
   otaPending = true;
 }
 
+void releaseResourcesForOta() {
+  if (cameraReady) {
+    esp_camera_deinit();
+    cameraReady = false;
+    Serial.println("[OTA] camera deinit");
+  }
+}
+
+bool otaUpdateAvailable(size_t* slotSizeOut) {
+  const esp_partition_t* next = esp_ota_get_next_update_partition(nullptr);
+  if (!next) return false;
+  if (slotSizeOut) *slotSizeOut = next->size;
+  return true;
+}
+
+void logPartitionInfo() {
+  size_t slotSize = 0;
+  bool otaOk = otaUpdateAvailable(&slotSize);
+  Serial.printf("[Partition] sketch=%u heap=%u ota=%s",
+                ESP.getSketchSize(), ESP.getFreeHeap(), otaOk ? "yes" : "no");
+  if (otaOk) {
+    Serial.printf(" slot=%u bytes\n", (unsigned)slotSize);
+  } else {
+    Serial.println(" (flash USB: PartitionScheme=min_spiffs, not Huge APP)");
+  }
+}
+
 void performOtaUpdate(const char* url) {
   Serial.printf("[OTA] starting: %s (heap=%u)\n", url, ESP.getFreeHeap());
   ensureWebServer();
@@ -956,6 +988,23 @@ void performOtaUpdate(const char* url) {
     mqttClient.disconnect();
     delay(200);
   }
+
+  releaseResourcesForOta();
+
+  size_t otaSlotSize = 0;
+  if (!otaUpdateAvailable(&otaSlotSize)) {
+    Serial.println("[OTA] no OTA slot (Huge APP — flash USB with min_spiffs)");
+    strncpy(otaErrorMsg, "No OTA slot — flash USB: min_spiffs", sizeof(otaErrorMsg) - 1);
+    otaErrorMsg[sizeof(otaErrorMsg) - 1] = '\0';
+    strncpy(otaFailedPhase, "preparing", sizeof(otaFailedPhase) - 1);
+    otaFailedPhase[sizeof(otaFailedPhase) - 1] = '\0';
+    setOtaProgress("failed", -1, 0, 0);
+    publishOtaEvent("failed", -1);
+    setStatus("OTA failed: no partition");
+    return;
+  }
+  Serial.printf("[OTA] OTA slot: %u bytes\n", (unsigned)otaSlotSize);
+
   WiFi.setSleep(WIFI_PS_NONE);
   Serial.printf("[OTA] heap after cleanup: %u\n", ESP.getFreeHeap());
 
@@ -1281,15 +1330,16 @@ void ensureWebServer() {
 // Setup / loop
 // =====================
 void setup() {
+  pinMode(LED_FLASH_PIN, OUTPUT);
+  setFlashLed(false);
+
   Serial.begin(115200);
   delay(1000);
 
   Serial.println();
   Serial.println("ESP32-CAM photo station");
   logFirmwareInfo("esp32-cam");
-
-  pinMode(LED_FLASH_PIN, OUTPUT);
-  setFlashLed(false);
+  logPartitionInfo();
 
   littleFsReady = LittleFS.begin(true, "/littlefs", 10, "spiffs");
   if (!littleFsReady) {

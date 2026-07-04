@@ -1,9 +1,10 @@
 #pragma once
 
+#include <WiFi.h>
 #include <ArduinoJson.h>
 
 #ifndef FW_VERSION
-#define FW_VERSION "1.1.1"
+#define FW_VERSION "1.1.3"
 #endif
 
 #define FW_BUILD_DATE __DATE__
@@ -17,4 +18,17 @@ inline void logFirmwareInfo(const char* device) {
 inline void addFirmwareTelemetry(JsonDocument& doc) {
   doc["fw_version"] = FW_VERSION;
   doc["fw_build"] = FW_BUILD_DATE " " FW_BUILD_TIME;
+}
+
+// Поля для админки (device-card): ip, wifi_ssid, rssi
+inline void addNetworkTelemetry(JsonDocument& doc) {
+  if (WiFi.status() == WL_CONNECTED) {
+    doc["ip"] = WiFi.localIP().toString();
+    doc["wifi_ssid"] = WiFi.SSID();
+    doc["rssi"] = WiFi.RSSI();
+  } else {
+    doc["ip"] = "";
+    doc["wifi_ssid"] = "";
+    doc["rssi"] = 0;
+  }
 }

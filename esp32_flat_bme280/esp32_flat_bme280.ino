@@ -53,7 +53,8 @@
 #define JOY_RIGHT_THRESHOLD  3000
 #define JOY_DOWN_THRESHOLD   3000
 
-// Встроенный LED на большинстве ESP32 DevKit (GPIO 2, active LOW)
+// Встроенный LED на большинстве ESP32 DevKit (GPIO 2, active LOW). По умолчанию выкл;
+// включается только командой led/pin_write (индикация загрузки — кратко, потом off).
 #ifndef LED_BUILTIN
 #define LED_BUILTIN 2
 #endif
@@ -753,8 +754,12 @@ void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
     }
     if (value <= 1) {
       if (!isPinOutputCapable(pin)) return;
-      pinMode(pin, OUTPUT);
-      digitalWrite(pin, value ? HIGH : LOW);
+      if (pin == LED_BUILTIN) {
+        setBoardLed(value != 0);
+      } else {
+        pinMode(pin, OUTPUT);
+        digitalWrite(pin, value ? HIGH : LOW);
+      }
       Serial.printf("[MQTT] pin_write pin=%u value=%d\n", pin, value);
     } else {
       if (!isPinOutputCapable(pin)) return;
@@ -838,12 +843,12 @@ void publishMqttTelemetry() {
 
   StaticJsonDocument<384> doc;
   doc["uptime"] = millis() / 1000UL;
-  doc["rssi"] = WiFi.RSSI();
   doc["heap"] = ESP.getFreeHeap();
   doc["bme_ready"] = bmeReady;
   doc["led"] = boardLedOn;
   doc["screen"] = (int)currentScreen + 1;
   doc["overlay"] = showingTimeScreen ? "time" : (showingInfoScreen ? "status" : "");
+  addNetworkTelemetry(doc);
   addFirmwareTelemetry(doc);
 
   if (bmeReady) {
@@ -1597,6 +1602,9 @@ void updateHomeScreenIfNeeded() {
 // Setup / loop
 // =====================
 void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
+  setBoardLed(false);
+
   Serial.begin(115200);
   delay(1000);
 
@@ -1607,8 +1615,6 @@ void setup() {
   pinMode(JOY_SW_PIN, INPUT_PULLUP);
   pinMode(JOY_X_PIN, INPUT);
   pinMode(JOY_Y_PIN, INPUT);
-  pinMode(LED_BUILTIN, OUTPUT);
-  setBoardLed(false);
 
   analogReadResolution(12);
 
