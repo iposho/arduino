@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
+# Требует bash (массивы, [[ ]], here-string). Не запускайте через sh/dash.
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec /usr/bin/env bash "$0" "$@"
+fi
+
 # Сборка OTA-бинарников (.ino.bin) для всех ESP32-проектов.
 # Использование:
 #   ./scripts/build-ota.sh           — все проекты
 #   ./scripts/build-ota.sh flat      — только esp32_flat_bme280
 #   ./scripts/build-ota.sh lamp      — только esp32_lamp
+#   ./scripts/build-ota.sh flamingo  — только esp32_flamingo
+#   ./scripts/build-ota.sh default   — только esp32_default
 #   ./scripts/build-ota.sh balcony cam
 
 set -euo pipefail
@@ -56,16 +63,19 @@ ota_filename() {
   echo "${stem}-${version}-${build_date}.bin"
 }
 
-# id|sketch_dir|fqbn|build_subdir|ota_basename
+# id|sketch_dir|fqbn|build_subdir|ota_basename|partition
 PROJECTS=(
-  "flat|esp32_flat_bme280|esp32:esp32:esp32:PartitionScheme=default|esp32.esp32.esp32|esp32-flat.bin"
-  "balcony|esp32_balcony_pms5003_bme280|esp32:esp32:esp32:PartitionScheme=default|esp32.esp32.esp32|esp32-balcony.bin"
-  "cam|esp32_cam|esp32:esp32:esp32cam:PartitionScheme=min_spiffs|esp32.esp32.esp32cam|esp32-cam.bin"
-  "lamp|esp32_lamp|esp32:esp32:esp32:PartitionScheme=default|esp32.esp32.esp32|esp32-lamp.bin"
+  "flat|esp32_flat_bme280|esp32:esp32:esp32:PartitionScheme=default|esp32.esp32.esp32|esp32-flat.bin|default"
+  "balcony|esp32_balcony_pms5003_bme280|esp32:esp32:esp32:PartitionScheme=default|esp32.esp32.esp32|esp32-balcony.bin|default"
+  "cam|esp32_cam|esp32:esp32:esp32cam:PartitionScheme=min_spiffs|esp32.esp32.esp32cam|esp32-cam.bin|min_spiffs"
+  "lamp|esp32_lamp|esp32:esp32:esp32:PartitionScheme=default|esp32.esp32.esp32|esp32-lamp.bin|default"
+  "flamingo|esp32_flamingo|esp32:esp32:esp32:PartitionScheme=default|esp32.esp32.esp32|esp32-flamingo.bin|default"
+  "default|esp32_default|esp32:esp32:esp32:PartitionScheme=default|esp32.esp32.esp32|esp32-default.bin|default"
 )
 
 should_build() {
   local id="$1"
+  shift
   [[ $# -eq 0 ]] && return 0
   local target
   for target in "$@"; do
@@ -75,8 +85,8 @@ should_build() {
 }
 
 build_project() {
-  local id sketch_dir fqbn build_subdir ota_basename
-  IFS='|' read -r id sketch_dir fqbn build_subdir ota_basename <<<"$1"
+  local id sketch_dir fqbn build_subdir ota_basename partition
+  IFS='|' read -r id sketch_dir fqbn build_subdir ota_basename partition <<<"$1"
 
   local sketch="$ROOT/$sketch_dir"
   local build_path="$sketch/build/$build_subdir"
@@ -93,6 +103,7 @@ build_project() {
   "$ARDUINO_CLI" compile \
     --fqbn "$fqbn" \
     --build-path "$build_path" \
+    --build-property "compiler.cpp.extra_flags=-I$ROOT/include" \
     "$sketch"
 
   local src_bin="$build_path/${ino_name}.bin"
@@ -108,6 +119,8 @@ build_project() {
   size="$(wc -c < "$OTA_DIR/$ota_name" | tr -d ' ')"
   sha="$(shasum -a 256 "$OTA_DIR/$ota_name" | awk '{print $1}')"
   echo "[$id] -> ota/$ota_name  (${size} bytes, sha256=${sha:0:12}...)"
+
+  python3 "$ROOT/scripts/update-firmware-manifest.py" "$id" "$sketch_dir" "$(read_fw_version "$sketch_dir")" "$partition" "$ota_name" "$size" "$sha"
 }
 
 main() {
@@ -121,7 +134,7 @@ main() {
 
   local entry id
   for entry in "${PROJECTS[@]}"; do
-    IFS='|' read -r id _ _ _ _ <<<"$entry"
+    IFS='|' read -r id _ _ _ _ _ <<<"$entry"
     if [[ ${#targets[@]} -gt 0 ]] && ! should_build "$id" "${targets[@]}"; then
       continue
     fi
@@ -134,7 +147,7 @@ main() {
   done
 
   if [[ $built -eq 0 ]]; then
-    echo "Ничего не собрано. Доступные цели: flat, balcony, cam, lamp" >&2
+    echo "Ничего не собрано. Доступные цели: flat, balcony, cam, lamp, flamingo, default" >&2
     exit 1
   fi
 

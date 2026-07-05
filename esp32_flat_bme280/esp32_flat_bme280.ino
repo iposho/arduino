@@ -11,6 +11,8 @@
 
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
+#include <Adafruit_AHTX0.h>
+#include <ScioSense_ENS160.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7735.h>
 
@@ -19,6 +21,7 @@
 // =====================
 #include "secrets.h"
 #include "firmware_info.h"
+#include "../include/ota_mqtt.h"
 
 // MQTT-топики (DEVICE_HOSTNAME из secrets.h):
 //   devices/<hostname>/status       — online/offline (LWT)
@@ -42,12 +45,37 @@
 #define BME_SCL_PIN 22
 #define BME280_ADDRESS 0x76
 
+// ENS160: ADDR high = 0x53 (как в тесте). Если не найден — ENS160_I2CADDR_0 (0x52).
+#ifndef ENS160_I2C_ADDRESS
+#define ENS160_I2C_ADDRESS ENS160_I2CADDR_1
+#endif
+
 // =====================
 // Joystick pins
 // =====================
 #define JOY_X_PIN   34
 #define JOY_Y_PIN   35
 #define JOY_SW_PIN  32
+
+// Тактовая кнопка: вкл/выкл вывеску «фламинго» по MQTT.
+//   нога 1 → GPIO 33
+//   нога 2 → GND
+// Внутренний pull-up: отпущена = HIGH, нажата = LOW.
+#define FLAMINGO_BTN_PIN  33
+
+// Подробные логи кнопки в Serial Monitor (115200). Выключите после отладки.
+#define FLAMINGO_BTN_DEBUG  1
+#define FLAMINGO_BTN_LOG_MS 2000UL
+
+#ifndef FLAMINGO_HOSTNAME
+#define FLAMINGO_HOSTNAME "esp32-flamingo"
+#endif
+
+// Relay: flat пишет в свой namespace (ACL часто блокирует чужие command-топики).
+// Топик строится в initMqttTopics(): devices/<DEVICE_HOSTNAME>/out/flamingo
+#ifndef FLAMINGO_DIRECT_COMMAND
+#define FLAMINGO_DIRECT_COMMAND 0
+#endif
 
 #define JOY_LEFT_THRESHOLD   1000
 #define JOY_RIGHT_THRESHOLD  3000
@@ -71,8 +99,16 @@ const unsigned long MQTT_TELEMETRY_INTERVAL = 10UL * 1000UL;
 #define FS_READ_MAX_BYTES 2800
 #define FS_LS_MAX_ENTRIES 32
 
-const unsigned long TIME_SHOW_MS = 5000UL;
-const unsigned long INFO_SHOW_MS = 5000UL;
+const unsigned long TIME_SHOW_MS = 9000UL;
+const unsigned long INFO_SHOW_MS = 7000UL;
+
+// Авто-переключение экрана при превышении (единожды до действия пользователя).
+#define ALERT_ECO2_PPM        1000
+#define ALERT_ECO2_CLEAR_PPM   950
+#define ALERT_TVOC_PPB         500
+#define ALERT_TVOC_CLEAR_PPB   450
+#define ALERT_AQI_VALUE        100
+#define ALERT_AQI_CLEAR         90
 
 // =====================
 // TFT
@@ -92,11 +128,33 @@ Adafruit_BME280 bme;
 bool bmeReady = false;
 
 // =====================
+// AHT21 (на модуле ENS160 — компенсация T/RH для газового сенсора)
+// =====================
+Adafruit_AHTX0 aht;
+bool ahtReady = false;
+
+// =====================
+// ENS160 (eCO2 / TVOC)
+// =====================
+ScioSense_ENS160 ens160(ENS160_I2C_ADDRESS);
+bool ens160Ready = false;
+bool ensDataValid = false;
+uint16_t lastEco2 = 0;
+uint16_t lastTvoc = 0;
+uint8_t lastEnsAqi = 0;
+float filteredEco2 = -999.0f;
+float filteredTvoc = -999.0f;
+const float ENS_EMA_ALPHA = 0.12f;
+int lastDisplayedEco2 = -1;
+int lastDisplayedTvoc = -1;
+
+// =====================
 // Screens
 // =====================
 enum Screen {
   SCREEN_HOME,
   SCREEN_OUTDOOR,
+  SCREEN_INDOOR,
   SCREEN_AQI,
   SCREEN_COUNT
 };
@@ -143,6 +201,10 @@ unsigned long timeScreenStart = 0;
 bool showingInfoScreen = false;
 unsigned long infoScreenStart = 0;
 
+bool alertLock = false;
+bool indoorAlertEpisode = false;
+bool aqiAlertEpisode = false;
+
 bool boardLedOn = false;
 
 // =====================
@@ -151,6 +213,14 @@ bool boardLedOn = false;
 bool lastButtonState = HIGH;
 unsigned long lastButtonTime = 0;
 const unsigned long BUTTON_DEBOUNCE = 120;
+
+bool lastFlamingoBtnState = HIGH;
+unsigned long lastFlamingoBtnTime = 0;
+unsigned long lastFlamingoBtnLog = 0;
+const unsigned long FLAMINGO_BTN_DEBOUNCE = 200;
+bool flamingoSignOn = false;
+bool flamingoStateKnown = false;
+bool flamingoTelemSeen = false;
 
 // =====================
 // Joystick state
@@ -193,6 +263,9 @@ char topicStatus[64];
 char topicTelemetry[64];
 char topicCommand[64];
 char topicCapabilities[64];
+char topicFlamingoCommand[64];
+char topicFlamingoTelemetry[64];
+char topicFlamingoRelay[64];
 bool mqttTopicsReady = false;
 
 const char *CAPABILITIES = R"CAP({
@@ -225,7 +298,30 @@ const char *CAPABILITIES = R"CAP({
       "icon": "rotate-cw",
       "description": "ESP.restart()"
     }
-  ]
+  ],
+  "metrics": [
+    { "key": "ip", "label": "IP-адрес", "icon": "globe", "group": "Сеть", "dashboard": true, "order": 0 },
+    { "key": "rssi", "label": "Сигнал Wi-Fi", "icon": "signal", "format": "rssi", "group": "Сеть", "dashboard": true, "order": 1 },
+    { "key": "uptime", "label": "Аптайм", "icon": "clock", "format": "uptime", "group": "Система", "dashboard": true, "order": 2 },
+    { "key": "heap", "keys": ["heap", "free_heap"], "label": "Свободная RAM", "icon": "memory", "format": "bytes", "group": "Система", "dashboard": true, "order": 3 },
+    { "key": "temperature", "label": "Температура", "icon": "thermometer", "format": "temperature", "unit": "°C", "group": "Комната", "dashboard": true, "order": 10 },
+    { "key": "humidity", "label": "Влажность", "icon": "droplets", "format": "percent", "group": "Комната", "dashboard": true, "order": 11 },
+    { "key": "pressure", "label": "Давление", "icon": "gauge", "format": "number", "unit": "мм рт.ст.", "group": "Комната", "order": 12 },
+    { "key": "eco2", "label": "eCO₂", "icon": "wind", "format": "number", "unit": "ppm", "group": "Комната", "dashboard": true, "order": 13 },
+    { "key": "tvoc", "label": "TVOC", "icon": "wind", "format": "number", "unit": "ppb", "group": "Комната", "order": 14 },
+    { "key": "aqi", "label": "AQI (балкон)", "icon": "activity", "format": "number", "group": "Воздух", "dashboard": true, "order": 15 },
+    { "key": "out_temperature", "label": "Температура (балкон)", "icon": "thermometer", "format": "temperature", "unit": "°C", "group": "Улица", "order": 20 },
+    { "key": "out_humidity", "label": "Влажность (балкон)", "icon": "droplets", "format": "percent", "group": "Улица", "order": 21 },
+    { "key": "out_pressure", "label": "Давление (балкон)", "icon": "gauge", "format": "number", "unit": "мм рт.ст.", "group": "Улица", "order": 22 },
+    { "key": "out_pm25", "label": "PM2.5 (балкон)", "icon": "activity", "format": "number", "unit": "µg/m³", "group": "Улица", "order": 23 },
+    { "key": "out_pm10", "label": "PM10 (балкон)", "icon": "activity", "format": "number", "unit": "µg/m³", "group": "Улица", "order": 24 },
+    { "key": "led", "label": "Светодиод", "icon": "lightbulb", "format": "boolean", "group": "Устройство", "order": 30 },
+    { "key": "fw_version", "label": "Версия прошивки", "icon": "cpu", "group": "Система", "order": 40 }
+  ],
+  "dashboard": {
+    "summary": ["temperature", "humidity", "eco2", "rssi"],
+    "max_items": 4
+  }
 })CAP";
 unsigned long lastMqttTelemetry = 0;
 
@@ -239,6 +335,16 @@ bool littleFsReady = false;
 // =====================
 const char* getAqiLevel(int value);
 const char* getAqiAdvice(int value);
+const char* getEco2Level(uint16_t ppm);
+const char* getEco2Advice(uint16_t ppm);
+const char* getEco2Verdict(uint16_t ppm);
+uint16_t getEco2Color(uint16_t ppm);
+void drawEco2Scale(int x, int y, int w, int h, uint16_t ppm);
+void drawIndoorAirScreen();
+void updateEns160IfNeeded();
+void feedEns160EnvData();
+void dismissScreenAlerts();
+void checkScreenAlerts();
 void drawCurrentScreen();
 void drawTimeScreen();
 void drawInfoScreen();
@@ -267,6 +373,10 @@ void handleFsWrite(const char* path, const char* content);
 void handleFsRm(const char* path);
 void handleJoystick();
 void handleButton();
+void handleFlamingoButton();
+void handleFlamingoTelemetry(byte* payload, unsigned int length);
+void publishFlamingoSign(bool on);
+void toggleFlamingoSign();
 void updateHomeScreenIfNeeded();
 int calculateEPA_AQI(float pm25, float pm10);
 
@@ -414,6 +524,12 @@ void initMqttTopics() {
   snprintf(topicTelemetry, sizeof(topicTelemetry), "devices/%s/telemetry", DEVICE_HOSTNAME);
   snprintf(topicCommand, sizeof(topicCommand), "devices/%s/command", DEVICE_HOSTNAME);
   snprintf(topicCapabilities, sizeof(topicCapabilities), "devices/%s/capabilities", DEVICE_HOSTNAME);
+  snprintf(topicFlamingoCommand, sizeof(topicFlamingoCommand),
+           "devices/%s/command", FLAMINGO_HOSTNAME);
+  snprintf(topicFlamingoTelemetry, sizeof(topicFlamingoTelemetry),
+           "devices/%s/telemetry", FLAMINGO_HOSTNAME);
+  snprintf(topicFlamingoRelay, sizeof(topicFlamingoRelay),
+           "devices/%s/out/flamingo", DEVICE_HOSTNAME);
 
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
   mqttClient.setCallback(handleMqttCommand);
@@ -439,7 +555,8 @@ bool isGpioPinAllowed(uint8_t pin) {
   if (pin == TFT_CS || pin == TFT_DC || pin == TFT_RST ||
       pin == TFT_SCLK || pin == TFT_MOSI ||
       pin == BME_SDA_PIN || pin == BME_SCL_PIN ||
-      pin == JOY_X_PIN || pin == JOY_Y_PIN || pin == JOY_SW_PIN) {
+      pin == JOY_X_PIN || pin == JOY_Y_PIN || pin == JOY_SW_PIN ||
+      pin == FLAMINGO_BTN_PIN) {
     return false;
   }
   return true;
@@ -674,6 +791,11 @@ void handleFsRm(const char* path) {
 }
 
 void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
+  if (strcmp(topic, topicFlamingoTelemetry) == 0) {
+    handleFlamingoTelemetry(payload, length);
+    return;
+  }
+
   Serial.printf("[MQTT] << %s (%u): %.*s\n", topic, length, length, payload);
 
   DynamicJsonDocument doc(length + 64);
@@ -824,6 +946,10 @@ void ensureMqtt() {
                          topicStatus, 1, true, "{\"status\":\"offline\"}")) {
     mqttClient.publish(topicStatus, "{\"status\":\"online\"}", true);
     mqttClient.subscribe(topicCommand, 1);
+    mqttClient.subscribe(topicFlamingoTelemetry, 0);
+    Serial.printf("[Flamingo] cmd topic  -> %s\n", topicFlamingoCommand);
+    Serial.printf("[Flamingo] relay topic -> %s\n", topicFlamingoRelay);
+    Serial.printf("[Flamingo] telem sub <- %s\n", topicFlamingoTelemetry);
     if (mqttClient.publish(topicCapabilities, CAPABILITIES, true)) {
       Serial.printf("[MQTT] capabilities -> %s\n", topicCapabilities);
     } else {
@@ -841,10 +967,12 @@ void ensureMqtt() {
 void publishMqttTelemetry() {
   if (!mqttClient.connected()) return;
 
-  StaticJsonDocument<384> doc;
+  StaticJsonDocument<512> doc;
   doc["uptime"] = millis() / 1000UL;
   doc["heap"] = ESP.getFreeHeap();
   doc["bme_ready"] = bmeReady;
+  doc["aht_ready"] = ahtReady;
+  doc["ens160_ready"] = ens160Ready;
   doc["led"] = boardLedOn;
   doc["screen"] = (int)currentScreen + 1;
   doc["overlay"] = showingTimeScreen ? "time" : (showingInfoScreen ? "status" : "");
@@ -860,6 +988,12 @@ void publishMqttTelemetry() {
     doc["pressure"] = p;
   }
 
+  if (ens160Ready && ensDataValid) {
+    doc["eco2"] = lastEco2;
+    doc["tvoc"] = lastTvoc;
+    doc["indoor_aqi"] = lastEnsAqi;
+  }
+
   if (outDataValid) {
     doc["out_temperature"] = outTemp;
     doc["out_humidity"] = outHumidity;
@@ -870,22 +1004,13 @@ void publishMqttTelemetry() {
 
   if (aqiDataValid) doc["aqi"] = aqiValue;
 
-  char buf[384];
+  char buf[512];
   size_t n = serializeJson(doc, buf);
   mqttClient.publish(topicTelemetry, buf, n);
 }
 
 void publishOtaEvent(const char* phase, int progress) {
-  if (!mqttClient.connected()) return;
-
-  StaticJsonDocument<192> doc;
-  doc["ota"] = phase;
-  if (progress >= 0) doc["progress"] = progress;
-
-  char buf[192];
-  size_t n = serializeJson(doc, buf);
-  mqttClient.publish(topicTelemetry, buf, n);
-  mqttClient.loop();
+  ota_mqtt::publish(phase, progress);
 }
 
 void queueOtaUpdate(const char* url) {
@@ -898,62 +1023,20 @@ void performOtaUpdate(const char* url) {
   Serial.printf("[OTA] starting: %s (heap=%u)\n", url, ESP.getFreeHeap());
   setStatus("OTA starting");
   showMessage("OTA UPDATE", "Downloading...", url);
+
+  ota_mqtt::bind(mqttClient, topicTelemetry, ensureMqtt, lastOtaProgress);
   publishOtaEvent("starting", 0);
   lastOtaProgress = 0;
 
-  // Освобождаем MQTT-сокет и память перед HTTPS-загрузкой
-  if (mqttClient.connected()) {
-    mqttClient.disconnect();
-    delay(200);
-  }
   WiFi.setSleep(WIFI_PS_NONE);
-  Serial.printf("[OTA] heap after cleanup: %u\n", ESP.getFreeHeap());
+  Serial.printf("[OTA] heap before download: %u\n", ESP.getFreeHeap());
 
-  httpUpdate.rebootOnUpdate(true);
-  httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-
-  httpUpdate.onStart([]() {
-    Serial.println("[OTA] start");
-    publishOtaEvent("downloading", 0);
-    lastOtaProgress = 0;
-  });
-
-  httpUpdate.onProgress([](size_t current, size_t total) {
-    int pct = (total > 0) ? (int)((current * 100UL) / total) : 0;
-    Serial.printf("[OTA] %d%%\n", pct);
-    if (pct >= lastOtaProgress + 10 || pct == 100) {
-      lastOtaProgress = pct;
-      publishOtaEvent("downloading", pct);
-      setStatus("OTA downloading");
-    }
-  });
-
-  httpUpdate.onEnd([]() {
-    Serial.println("[OTA] complete");
-    publishOtaEvent("rebooting", 100);
-    setStatus("OTA rebooting");
-  });
-
-  httpUpdate.onError([](int error) {
-    Serial.printf("[OTA] error %d: %s\n", error, httpUpdate.getLastErrorString().c_str());
-    publishOtaEvent("failed", -1);
-    setStatus("OTA failed");
-  });
-
-  t_httpUpdate_return ret;
-  if (strncmp(url, "https://", 8) == 0) {
-    WiFiClientSecure secureClient;
-    secureClient.setInsecure();
-    secureClient.setTimeout(30000);
-    ret = httpUpdate.update(secureClient, url);
-  } else {
-    WiFiClient client;
-    client.setTimeout(30000);
-    ret = httpUpdate.update(client, url);
-  }
-
+  t_httpUpdate_return ret = ota_mqtt::runUpdate(url);
   if (ret != HTTP_UPDATE_OK) {
     Serial.printf("[OTA] failed: %s\n", httpUpdate.getLastErrorString().c_str());
+    int p = lastOtaProgress >= 0 ? lastOtaProgress : 0;
+    publishOtaEvent("failed", p);
+    setStatus("OTA failed");
     showMessage("OTA FAILED", httpUpdate.getLastErrorString().c_str(), "");
     delay(3000);
     drawCurrentScreen();
@@ -1032,15 +1115,28 @@ void sendToSupabase(float temperature, float humidity, float pressureMmHg) {
   http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
   http.addHeader("Prefer", "return=minimal");
 
-  char json[160];
-  snprintf(
-    json,
-    sizeof(json),
-    "{\"temperature\":%.1f,\"pressure\":%.1f,\"humidity\":%.1f}",
-    temperature,
-    pressureMmHg,
-    humidity
-  );
+  char json[256];
+  if (ens160Ready && ensDataValid) {
+    snprintf(
+      json,
+      sizeof(json),
+      "{\"temperature\":%.1f,\"pressure\":%.1f,\"humidity\":%.1f,\"eco2\":%u,\"tvoc\":%u}",
+      temperature,
+      pressureMmHg,
+      humidity,
+      lastEco2,
+      lastTvoc
+    );
+  } else {
+    snprintf(
+      json,
+      sizeof(json),
+      "{\"temperature\":%.1f,\"pressure\":%.1f,\"humidity\":%.1f}",
+      temperature,
+      pressureMmHg,
+      humidity
+    );
+  }
 
   int code = http.POST(json);
   Serial.print("Supabase send: ");
@@ -1114,7 +1210,10 @@ void fetchWeatherFromSupabase() {
       snprintf(status, sizeof(status), "Metrics updated %s", timeBuf);
       setStatus(status);
 
-      if ((currentScreen == SCREEN_OUTDOOR || currentScreen == SCREEN_AQI) && !showingTimeScreen && !showingInfoScreen) {
+      checkScreenAlerts();
+
+      if ((currentScreen == SCREEN_OUTDOOR || currentScreen == SCREEN_AQI || currentScreen == SCREEN_INDOOR)
+          && !showingTimeScreen && !showingInfoScreen) {
         drawCurrentScreen();
       }
     } else {
@@ -1145,6 +1244,7 @@ void handleButton() {
       showingInfoScreen = false;
       timeScreenStart = now;
       lastButtonTime = now;
+      dismissScreenAlerts();
 
       Serial.println("Button -> time screen");
       drawTimeScreen();
@@ -1152,6 +1252,122 @@ void handleButton() {
   }
 
   lastButtonState = reading;
+}
+
+void handleFlamingoTelemetry(byte* payload, unsigned int length) {
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, payload, length)) {
+    Serial.println("[Flamingo] telemetry JSON parse error");
+    return;
+  }
+
+  if (doc["sign"].is<bool>()) {
+    flamingoSignOn = doc["sign"];
+    flamingoStateKnown = true;
+    flamingoTelemSeen = true;
+    Serial.printf("[Flamingo] telemetry sign=%s (confirmed)\n", flamingoSignOn ? "ON" : "OFF");
+  } else if (doc["sign"].is<int>()) {
+    flamingoSignOn = doc["sign"] != 0;
+    flamingoStateKnown = true;
+    flamingoTelemSeen = true;
+    Serial.printf("[Flamingo] telemetry sign=%s (confirmed)\n", flamingoSignOn ? "ON" : "OFF");
+  } else {
+    Serial.println("[Flamingo] telemetry without sign field");
+  }
+}
+
+void publishFlamingoSign(bool on) {
+  if (!mqttClient.connected()) {
+    Serial.println("[Flamingo] MQTT offline, skip command");
+    return;
+  }
+
+  StaticJsonDocument<64> doc;
+  doc["action"] = "sign";
+  doc["value"] = on;
+
+  char buf[64];
+  size_t n = serializeJson(doc, buf);
+  Serial.printf("[Flamingo] publish relay=%s payload=%s\n", topicFlamingoRelay, buf);
+
+  bool okRelay = mqttClient.publish(topicFlamingoRelay, buf, n);
+  mqttClient.loop();
+
+  bool okDirect = false;
+#if FLAMINGO_DIRECT_COMMAND
+  okDirect = mqttClient.publish(topicFlamingoCommand, buf, n);
+  mqttClient.loop();
+#endif
+
+  if (okRelay || okDirect) {
+    Serial.printf("[Flamingo] -> sent sign %s (relay=%s%s, ждём telemetry)\n",
+                  on ? "ON" : "OFF",
+                  okRelay ? "ok" : "fail",
+#if FLAMINGO_DIRECT_COMMAND
+                  okDirect ? ", direct=ok" : ", direct=fail"
+#else
+                  ""
+#endif
+                  );
+  } else {
+    Serial.printf("[Flamingo] publish FAILED mqtt_state=%d\n", mqttClient.state());
+  }
+}
+
+void toggleFlamingoSign() {
+  bool next = flamingoStateKnown ? !flamingoSignOn : true;
+  Serial.printf("[Flamingo] toggle: known=%d current=%s -> next=%s\n",
+                flamingoStateKnown,
+                flamingoStateKnown ? (flamingoSignOn ? "ON" : "OFF") : "?",
+                next ? "ON" : "OFF");
+  publishFlamingoSign(next);
+}
+
+void handleFlamingoButton() {
+  bool reading = digitalRead(FLAMINGO_BTN_PIN);
+  unsigned long now = millis();
+
+#if FLAMINGO_BTN_DEBUG
+  if (now - lastFlamingoBtnLog >= FLAMINGO_BTN_LOG_MS) {
+    lastFlamingoBtnLog = now;
+    Serial.printf("[Btn33] GPIO%d raw=%s mqtt=%s sign=%s%s\n",
+                  FLAMINGO_BTN_PIN,
+                  reading ? "HIGH" : "LOW",
+                  mqttClient.connected() ? "up" : "down",
+                  flamingoStateKnown ? (flamingoSignOn ? "ON" : "OFF") : "?",
+                  flamingoTelemSeen ? " (flamingo)" : " (no telem!)");
+  }
+
+  if (reading != lastFlamingoBtnState) {
+    Serial.printf("[Btn33] edge %s -> %s\n",
+                  lastFlamingoBtnState ? "HIGH" : "LOW",
+                  reading ? "HIGH" : "LOW");
+  }
+#endif
+
+  if (reading == LOW && lastFlamingoBtnState == HIGH) {
+    unsigned long since = now - lastFlamingoBtnTime;
+    if (since > FLAMINGO_BTN_DEBOUNCE) {
+      lastFlamingoBtnTime = now;
+      dismissScreenAlerts();
+      Serial.println("[Btn33] PRESS accepted -> toggle flamingo");
+      toggleFlamingoSign();
+    }
+#if FLAMINGO_BTN_DEBUG
+    else {
+      Serial.printf("[Btn33] PRESS ignored (debounce %lums < %lums)\n",
+                    since, FLAMINGO_BTN_DEBOUNCE);
+    }
+#endif
+  }
+
+#if FLAMINGO_BTN_DEBUG
+  if (reading == HIGH && lastFlamingoBtnState == LOW) {
+    Serial.println("[Btn33] RELEASE");
+  }
+#endif
+
+  lastFlamingoBtnState = reading;
 }
 
 void handleJoystick() {
@@ -1174,6 +1390,7 @@ void handleJoystick() {
   bool screenChanged = false;
 
   if (y >= JOY_DOWN_THRESHOLD) {
+    dismissScreenAlerts();
     showingInfoScreen = true;
     showingTimeScreen = false;
     infoScreenStart = now;
@@ -1205,9 +1422,64 @@ void handleJoystick() {
   lastJoyTime = now;
 
   if (screenChanged) {
+    dismissScreenAlerts();
     showingTimeScreen = false;
     showingInfoScreen = false;
     drawCurrentScreen();
+  }
+}
+
+void dismissScreenAlerts() {
+  if (!alertLock) return;
+  alertLock = false;
+  Serial.println("[Alert] dismissed by user");
+}
+
+void checkScreenAlerts() {
+  if (showingTimeScreen || showingInfoScreen) return;
+  if (alertLock) return;
+
+  int eco2 = (filteredEco2 >= 0) ? (int)round(filteredEco2) : -1;
+  int tvoc = (filteredTvoc >= 0) ? (int)round(filteredTvoc) : -1;
+
+  if (ensDataValid) {
+    bool eco2Clear = eco2 < 0 || eco2 <= ALERT_ECO2_CLEAR_PPM;
+    bool tvocClear = tvoc < 0 || tvoc <= ALERT_TVOC_CLEAR_PPB;
+    if (eco2Clear && tvocClear) indoorAlertEpisode = false;
+  }
+
+  if (aqiDataValid && aqiValue <= ALERT_AQI_CLEAR) {
+    aqiAlertEpisode = false;
+  }
+
+  bool eco2High = ensDataValid && eco2 > ALERT_ECO2_PPM;
+  bool tvocHigh = ensDataValid && tvoc > ALERT_TVOC_PPB;
+  bool indoorHigh = eco2High || tvocHigh;
+
+  if (indoorHigh && !indoorAlertEpisode) {
+    indoorAlertEpisode = true;
+    currentScreen = SCREEN_INDOOR;
+    showingTimeScreen = false;
+    showingInfoScreen = false;
+    lastDisplayedEco2 = -1;
+    lastDisplayedTvoc = -1;
+    drawCurrentScreen();
+    alertLock = true;
+    setStatus(eco2High ? "CO2 high!" : "TVOC high!");
+    Serial.printf("[Alert] -> indoor screen (eCO2=%d tvoc=%d)\n", eco2, tvoc);
+    return;
+  }
+
+  bool aqiHigh = aqiDataValid && aqiValue > ALERT_AQI_VALUE;
+  if (aqiHigh && !aqiAlertEpisode) {
+    aqiAlertEpisode = true;
+    currentScreen = SCREEN_AQI;
+    showingTimeScreen = false;
+    showingInfoScreen = false;
+    drawCurrentScreen();
+    alertLock = true;
+    setStatus("AQI high!");
+    Serial.printf("[Alert] -> AQI screen (aqi=%d)\n", aqiValue);
   }
 }
 
@@ -1289,6 +1561,214 @@ const char* getAqiAdvice(int value) {
   if (value <= 200) return "Limit activity";
   if (value <= 300) return "Stay indoors";
   return "Avoid outdoor";
+}
+
+const char* getEco2Level(uint16_t ppm) {
+  if (ppm <= 800)  return "Good";
+  if (ppm <= 1000) return "Moderate";
+  if (ppm <= 1500) return "Poor";
+  return "Bad";
+}
+
+const char* getEco2Advice(uint16_t ppm) {
+  if (ppm <= 800)  return "Fresh air";
+  if (ppm <= 1000) return "Ventilate soon";
+  if (ppm <= 1500) return "Open window";
+  return "Air stale";
+}
+
+uint16_t getEco2Color(uint16_t ppm) {
+  if (ppm <= 800)  return COLOR_GREEN;
+  if (ppm <= 1000) return COLOR_YELLOW;
+  if (ppm <= 1500) return COLOR_ORANGE;
+  return COLOR_RED;
+}
+
+const char* getEco2Verdict(uint16_t ppm) {
+  if (ppm <= 1000) return "NORM";
+  return "BAD";
+}
+
+void drawEco2Scale(int x, int y, int w, int h, uint16_t ppm) {
+  int segmentWidth = w / 4;
+
+  uint16_t colors[4] = {
+    COLOR_GREEN,
+    COLOR_YELLOW,
+    COLOR_ORANGE,
+    COLOR_RED
+  };
+
+  for (int i = 0; i < 4; i++) {
+    tft.fillRect(x + i * segmentWidth, y, segmentWidth - 1, h, colors[i]);
+  }
+
+  int markerX = x + map(constrain((int)ppm, 400, 2000), 400, 2000, 0, w - 4);
+  tft.fillTriangle(
+    markerX,
+    y + h + 6,
+    markerX + 4,
+    y + h + 6,
+    markerX + 2,
+    y + h + 1,
+    COLOR_TEXT
+  );
+}
+
+void drawIndoorAirScreen() {
+  tft.fillScreen(COLOR_BG);
+  drawHeader("Indoor CO2", COLOR_CYAN);
+
+  if (!ens160Ready) {
+    drawCard(8, 36, 144, 64, "ENS160", COLOR_RED);
+    tft.setTextColor(COLOR_TEXT);
+    tft.setTextSize(2);
+    tft.setCursor(22, 58);
+    tft.print("No sensor");
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_MUTED);
+    tft.setCursor(18, 84);
+    tft.print("SDA21 SCL22 0x53");
+    drawStatusBar();
+    return;
+  }
+
+  if (!ensDataValid || filteredEco2 < 0) {
+    drawCard(8, 36, 144, 64, "ENS160", COLOR_CYAN);
+    tft.setTextColor(COLOR_TEXT);
+    tft.setTextSize(2);
+    tft.setCursor(18, 58);
+    tft.print("Warming up");
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_MUTED);
+    tft.setCursor(24, 84);
+    tft.print("First read ~1 min");
+    drawStatusBar();
+    return;
+  }
+
+  uint16_t showEco2 = (uint16_t)round(filteredEco2);
+  uint16_t showTvoc = (uint16_t)round(filteredTvoc);
+  uint16_t eco2Color = getEco2Color(showEco2);
+  const char* verdict = getEco2Verdict(showEco2);
+  bool isNorm = (showEco2 <= 1000);
+
+  drawCard(6, 30, 72, 50, "eCO2", eco2Color);
+  tft.setTextColor(COLOR_TEXT);
+
+  char eco2Buf[8];
+  snprintf(eco2Buf, sizeof(eco2Buf), "%u", showEco2);
+  uint8_t eco2Size = (showEco2 >= 1000) ? 2 : 3;
+
+  tft.setTextSize(eco2Size);
+  int16_t bx, by;
+  uint16_t bw, bh;
+  tft.getTextBounds(eco2Buf, 12, 48, &bx, &by, &bw, &bh);
+  tft.setCursor(12, 48);
+  tft.print(eco2Buf);
+
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_MUTED);
+  tft.setCursor(12 + bw + 2, 48 + bh - 8);
+  tft.print("ppm");
+
+  drawCard(82, 30, 72, 50, verdict, eco2Color);
+  tft.setTextColor(isNorm ? COLOR_GREEN : COLOR_RED);
+  tft.setTextSize(isNorm ? 2 : 3);
+  tft.setCursor(isNorm ? 96 : 94, isNorm ? 46 : 44);
+  tft.print(verdict);
+
+  tft.setTextColor(COLOR_TEXT);
+  tft.setTextSize(1);
+  tft.setCursor(88, 62);
+  tft.print(getEco2Level(showEco2));
+
+  tft.setTextColor(COLOR_MUTED);
+  tft.setCursor(8, 84);
+  tft.print("TVOC");
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(36, 84);
+  tft.print(showTvoc);
+  tft.print(" ppb  ");
+  tft.setTextColor(COLOR_MUTED);
+  tft.print(getEco2Advice(showEco2));
+
+  drawEco2Scale(8, 92, 144, 8, showEco2);
+
+  tft.setTextColor(COLOR_MUTED);
+  tft.setTextSize(1);
+  tft.setCursor(8, 106);
+  tft.print("400");
+
+  tft.setCursor(68, 106);
+  tft.print("1000");
+
+  tft.setCursor(128, 106);
+  tft.print("2000");
+
+  drawStatusBar();
+}
+
+void feedEns160EnvData() {
+  if (!ens160Ready) return;
+
+  if (ahtReady) {
+    sensors_event_t humidity, temp;
+    aht.getEvent(&humidity, &temp);
+    ens160.set_envdata(temp.temperature, humidity.relative_humidity);
+    return;
+  }
+
+  // Запасной вариант, если AHT не найден (датчик в другом месте — хуже для ENS160)
+  if (bmeReady) {
+    float t = (filteredTemp > -900) ? filteredTemp : bme.readTemperature();
+    float h = (filteredHum > -900)  ? filteredHum  : bme.readHumidity();
+    ens160.set_envdata(t, h);
+  }
+}
+
+void updateEns160IfNeeded() {
+  if (!ens160Ready) return;
+
+  feedEns160EnvData();
+
+  if (!ens160.available()) return;
+  if (!ens160.measure(true)) return;
+
+  lastEco2 = ens160.geteCO2();
+  lastTvoc = ens160.getTVOC();
+  lastEnsAqi = ens160.getAQI();
+  ensDataValid = true;
+
+  if (filteredEco2 < 0) {
+    filteredEco2 = (float)lastEco2;
+    filteredTvoc = (float)lastTvoc;
+  } else {
+    filteredEco2 = ((float)lastEco2 * ENS_EMA_ALPHA) + (filteredEco2 * (1.0f - ENS_EMA_ALPHA));
+    filteredTvoc = ((float)lastTvoc * ENS_EMA_ALPHA) + (filteredTvoc * (1.0f - ENS_EMA_ALPHA));
+  }
+
+  if (currentScreen != SCREEN_INDOOR) return;
+  if (showingTimeScreen || showingInfoScreen) return;
+
+  int roundedEco2 = (int)round(filteredEco2);
+  int roundedTvoc = (int)round(filteredTvoc);
+
+  bool verdictChanged =
+    lastDisplayedEco2 >= 0 &&
+    ((lastDisplayedEco2 <= 1000) != (roundedEco2 <= 1000));
+  bool eco2Changed =
+    lastDisplayedEco2 < 0 || abs(roundedEco2 - lastDisplayedEco2) >= 10;
+  bool tvocChanged =
+    lastDisplayedTvoc < 0 || abs(roundedTvoc - lastDisplayedTvoc) >= 15;
+
+  if (!eco2Changed && !tvocChanged && !verdictChanged) return;
+
+  lastDisplayedEco2 = roundedEco2;
+  lastDisplayedTvoc = roundedTvoc;
+  drawIndoorAirScreen();
+
+  checkScreenAlerts();
 }
 
 void drawAqiScale(int x, int y, int w, int h, int value) {
@@ -1376,53 +1856,51 @@ void drawAqiScreen() {
   drawStatusBar();
 }
 
+void drawInfoStatusCell(int x, int y, const char* label, bool ok) {
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_MUTED);
+  tft.setCursor(x, y);
+  tft.print(label);
+  tft.fillCircle(x + 30, y + 4, 3, ok ? COLOR_GREEN : COLOR_RED);
+}
+
 void drawInfoScreen() {
   tft.fillScreen(COLOR_BG);
   drawHeader("System info", COLOR_GREEN);
-  drawCard(6, 30, 148, 54, "STATUS", COLOR_GREEN);
+  drawCard(6, 26, 148, 58, "STATUS", COLOR_GREEN);
+
+  bool wifiOk = WiFi.status() == WL_CONNECTED;
+  bool mqttOk = mqttClient.connected();
+
+  drawInfoStatusCell(12, 40, "WiFi", wifiOk);
+  drawInfoStatusCell(58, 40, "BME", bmeReady);
+  drawInfoStatusCell(104, 40, "AHT", ahtReady);
+
+  drawInfoStatusCell(12, 54, "ENS", ens160Ready);
+  drawInfoStatusCell(58, 54, "OUT", outDataValid);
+  drawInfoStatusCell(104, 54, "MQTT", mqttOk);
 
   tft.setTextSize(1);
-
   tft.setTextColor(COLOR_MUTED);
-  tft.setCursor(14, 48);
-  tft.print("WiFi");
-  tft.setTextColor(WiFi.status() == WL_CONNECTED ? COLOR_GREEN : COLOR_RED);
-  tft.setCursor(70, 48);
-  tft.print(WiFi.status() == WL_CONNECTED ? "connected" : "offline");
-
-  tft.setTextColor(COLOR_MUTED);
-  tft.setCursor(14, 64);
-  tft.print("BME280");
-  tft.setTextColor(bmeReady ? COLOR_GREEN : COLOR_RED);
-  tft.setCursor(70, 64);
-  tft.print(bmeReady ? "ready" : "error");
-
-  tft.setTextColor(COLOR_MUTED);
-  tft.setCursor(14, 80);
-  tft.print("Outdoor");
-  tft.setTextColor(outDataValid ? COLOR_GREEN : COLOR_RED);
-  tft.setCursor(70, 80);
-  tft.print(outDataValid ? "loaded" : "no data");
-
-  tft.setTextColor(COLOR_MUTED);
-  tft.setCursor(14, 96);
-  tft.print("AQI Calc");
-  tft.setTextColor(aqiDataValid ? COLOR_GREEN : COLOR_RED);
-  tft.setCursor(70, 96);
-  tft.print(aqiDataValid ? "ready" : "error");
+  tft.setCursor(12, 68);
+  tft.print("IP");
+  tft.setTextColor(wifiOk ? COLOR_TEXT : COLOR_RED);
+  tft.setCursor(26, 68);
+  tft.print(wifiOk ? WiFi.localIP().toString().c_str() : "---");
 
   drawCard(6, 88, 148, 24, "FIRMWARE", COLOR_CYAN);
   tft.setTextColor(COLOR_MUTED);
-  tft.setCursor(14, 96);
-  tft.print("Version");
+  tft.setCursor(12, 98);
+  tft.print("Ver");
   tft.setTextColor(COLOR_TEXT);
-  tft.setCursor(70, 96);
+  tft.setCursor(30, 98);
   tft.print(FW_VERSION);
+
   tft.setTextColor(COLOR_MUTED);
-  tft.setCursor(14, 106);
+  tft.setCursor(12, 108);
   tft.print("Build");
   tft.setTextColor(COLOR_TEXT);
-  tft.setCursor(70, 106);
+  tft.setCursor(40, 108);
   tft.print(FW_BUILD_DATE);
 
   drawStatusBar();
@@ -1550,6 +2028,16 @@ void drawCurrentScreen() {
       drawStatusBar();
     }
   }
+  else if (currentScreen == SCREEN_INDOOR) {
+    if (filteredEco2 >= 0) {
+      lastDisplayedEco2 = (int)round(filteredEco2);
+      lastDisplayedTvoc = (int)round(filteredTvoc);
+    } else {
+      lastDisplayedEco2 = -1;
+      lastDisplayedTvoc = -1;
+    }
+    drawIndoorAirScreen();
+  }
   else if (currentScreen == SCREEN_AQI) {
     drawAqiScreen();
   }
@@ -1615,6 +2103,11 @@ void setup() {
   pinMode(JOY_SW_PIN, INPUT_PULLUP);
   pinMode(JOY_X_PIN, INPUT);
   pinMode(JOY_Y_PIN, INPUT);
+  pinMode(FLAMINGO_BTN_PIN, INPUT_PULLUP);
+  lastFlamingoBtnState = digitalRead(FLAMINGO_BTN_PIN);
+  Serial.printf("[Btn33] init GPIO%d INPUT_PULLUP, startup=%s\n",
+                FLAMINGO_BTN_PIN,
+                lastFlamingoBtnState ? "HIGH (released)" : "LOW (pressed?)");
 
   analogReadResolution(12);
 
@@ -1655,7 +2148,34 @@ void setup() {
   } else {
     Serial.println("BME280 OK");
     setStatus("BME280 ready");
-    showMessage("BME280 OK", "Starting WiFi", "");
+    showMessage("BME280 OK", "Starting AHT21", "");
+    delay(800);
+  }
+
+  ahtReady = aht.begin();
+  if (!ahtReady) {
+    Serial.println("AHT21 not found (ENS160 will use BME for T/RH)");
+    setStatus("AHT21 missing");
+    showMessage("AHT WARN", "Using BME T/RH", "for ENS160");
+    delay(1200);
+  } else {
+    Serial.println("AHT21 OK");
+    setStatus("AHT21 ready");
+    showMessage("AHT21 OK", "Starting ENS160", "");
+    delay(800);
+  }
+
+  ens160Ready = ens160.begin();
+  if (!ens160Ready) {
+    Serial.println("ENS160 not found");
+    setStatus("ENS160 error");
+    showMessage("ENS160 ERROR", "Check I2C addr", "0x52 or 0x53");
+    delay(1500);
+  } else {
+    ens160.setMode(ENS160_OPMODE_STD);
+    Serial.println("ENS160 OK");
+    setStatus("ENS160 ready");
+    showMessage("ENS160 OK", "Starting WiFi", "");
     delay(800);
   }
 
@@ -1697,6 +2217,7 @@ void loop() {
 
   handleJoystick();
   handleButton();
+  handleFlamingoButton();
 
   if (showingTimeScreen) {
     if (now - timeScreenStart >= TIME_SHOW_MS) {
@@ -1718,6 +2239,8 @@ void loop() {
 
   if (now - lastSensorCheckTime >= SENSOR_CHECK_INTERVAL) {
     updateHomeScreenIfNeeded();
+    updateEns160IfNeeded();
+    checkScreenAlerts();
     lastSensorCheckTime = now;
   }
 

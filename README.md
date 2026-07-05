@@ -43,6 +43,42 @@ flowchart LR
 
 ## Проекты
 
+**Плата:** ESP32 Dev Module, Partition = **Default** (4MB with spiffs, OTA).
+
+---
+
+### 0. esp32_default — Универсальная прошивка по умолчанию
+
+Базовая прошивка для **любой новой ESP32 DevKit** без датчиков и периферии.
+
+- Wi-Fi + MQTT сразу после прошивки
+- Телеметрия каждые 10 с (IP, RSSI, uptime, heap, версия)
+- Watchdog 30 с, автопереподключение Wi-Fi
+- OTA — можно сразу обновить на целевую прошивку (flat, lamp, …)
+
+**MQTT-команды:**
+
+| action | Описание |
+|--------|----------|
+| `led` + `value: bool` | Встроенный LED платы (GPIO 2) |
+| `status` | Немедленно опубликовать телеметрию |
+| `reboot` | Перезагрузка |
+| `ota` + `url: string` | OTA-обновление по HTTP(S) |
+| `pin_mode` + `pin`, `mode` | `OUTPUT` / `INPUT` / `INPUT_PULLUP` |
+| `pin_write` + `pin`, `value` | Цифровой 0/1 или PWM 0–255 |
+| `pin_read` + `pin` | Чтение пина → ответ в telemetry |
+
+**Быстрый старт:**
+
+1. Скопируйте `secrets.example.h` → `secrets.h`, задайте Wi-Fi и `DEVICE_HOSTNAME`
+2. Плата: **ESP32 Dev Module**, Partition = **Default**
+3. Прошейте `esp32_default.ino` по USB
+4. Проверьте в MQTT: `devices/<hostname>/status` → online
+
+**Плата:** ESP32 Dev Module, Partition = **Default**.
+
+---
+
 ### 1. esp32_balcony_pms5003_bme280 — Балконная метеостанция
 
 ESP32 DevKit + BME280 + PMS5003 + OLED SSD1306 128×64 + RGB-светофор.
@@ -246,20 +282,21 @@ ESP32 DevKit + LED-лампа на **2 провода** (красный/чёрн
 | esp32_flat | ✓ | ✓ | ✓ |
 | esp32_cam | ✓ | ✓ | — |
 | esp32_lamp | ✓ | ✓ | — |
+| esp32_default | ✓ | ✓ | — |
 
 `DEVICE_HOSTNAME` используется как имя в роутере и как MQTT device id.
 
 ### 2. Библиотеки (Arduino Library Manager)
 
-| Библиотека | Балкон | Комната | Камера | Лампа |
-|------------|:------:|:-------:|:------:|:-----:|
-| Adafruit BME280 Library | ✓ | ✓ | | |
-| Adafruit GFX Library | ✓ | ✓ | | |
-| Adafruit SSD1306 | ✓ | | | |
-| Adafruit ST7735 and ST7789 Library | | ✓ | | |
-| PMS Library | ✓ | | | |
-| ArduinoJson | ✓ | ✓ | ✓ | ✓ |
-| PubSubClient | ✓ | ✓ | ✓ | ✓ |
+| Библиотека | Балкон | Комната | Камера | Лампа | Default |
+|------------|:------:|:-------:|:------:|:-----:|:-------:|
+| Adafruit BME280 Library | ✓ | ✓ | | | |
+| Adafruit GFX Library | ✓ | ✓ | | | |
+| Adafruit SSD1306 | ✓ | | | | |
+| Adafruit ST7735 and ST7789 Library | | ✓ | | | |
+| PMS Library | ✓ | | | | |
+| ArduinoJson | ✓ | ✓ | ✓ | ✓ | ✓ |
+| PubSubClient | ✓ | ✓ | ✓ | ✓ | ✓ |
 
 Камера использует встроенные `esp_camera` и `SD_MMC` (ESP32 Arduino core).
 
@@ -293,6 +330,7 @@ ESP32 DevKit + LED-лампа на **2 провода** (красный/чёрн
 | `balcony` | ESP32 Dev Module | Default | `ota/esp32-balcony-1.1.0-20260704.bin` |
 | `cam` | AI Thinker ESP32-CAM | min_spiffs | `ota/esp32-cam-1.1.0-20260704.bin` |
 | `lamp` | ESP32 Dev Module | Default | `ota/esp32-lamp-1.1.0-20260704.bin` |
+| `default` | ESP32 Dev Module | Default | `ota/esp32-default-1.0.0-20260704.bin` |
 
 ```bash
 ./scripts/build-ota.sh              # все проекты
@@ -304,6 +342,8 @@ ESP32 DevKit + LED-лампа на **2 провода** (красный/чёрн
 
 Переменная `ARDUINO_CLI` переопределяет путь к CLI, если он не в PATH и Arduino IDE установлена нестандартно.
 
+**Версионирование:** папка `ota/` в `.gitignore` — бинарники локальные и могут быть удалены. Последние собранные версии (номер, дата, sha256) хранятся в **`include/firmware_manifest.json`** (коммитится в git). При изменении прошивки поднимайте `FW_VERSION` в `firmware_info.h` и обновляйте манифест; `build-ota.sh` дописывает `last_build` автоматически.
+
 ## Структура репозитория
 
 ```
@@ -311,7 +351,11 @@ arduino/
 ├── assets/
 │   └── hero.png                    # Обложка README
 ├── scripts/
-│   └── build-ota.sh                # Сборка OTA-бинарников
+│   ├── build-ota.sh                # Сборка OTA-бинарников
+│   └── update-firmware-manifest.py # Обновление include/firmware_manifest.json
+├── include/
+│   ├── firmware_info.h             # FW_VERSION и телеметрия
+│   └── firmware_manifest.json      # Последние OTA-сборки (в git, не ota/)
 ├── ota/                            # Готовые .bin для OTA (.gitignore)
 ├── esp32_balcony_pms5003_bme280/   # Балконная метеостанция
 │   ├── esp32_balcony_pms5003_bme280.ino
@@ -325,6 +369,11 @@ arduino/
 │   └── secrets.example.h
 ├── esp32_cam/                      # ESP32-CAM, фото на SD
 │   ├── esp32_cam.ino
+│   ├── build/                      # (.gitignore)
+│   ├── secrets.h                   # (.gitignore)
+│   └── secrets.example.h
+├── esp32_default/                  # Универсальная прошивка по умолчанию
+│   ├── esp32_default.ino
 │   ├── build/                      # (.gitignore)
 │   ├── secrets.h                   # (.gitignore)
 │   └── secrets.example.h

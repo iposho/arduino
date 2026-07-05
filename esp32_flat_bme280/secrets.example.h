@@ -11,6 +11,17 @@
 #define MQTT_USER        "esp32"
 #define MQTT_PASS        "change-me-esp32"
 
+// MQTT id вывески «фламинго» (кнопка на flat шлёт команды сюда)
+#ifndef FLAMINGO_HOSTNAME
+#define FLAMINGO_HOSTNAME "esp32-flamingo"
+#endif
+
+// Mosquitto ACL (пользователь esp32): flat должен иметь
+//   write  devices/<DEVICE_HOSTNAME>/out/flamingo   — relay для кнопки (см. topicFlamingoRelay)
+//   write  devices/<FLAMINGO_HOSTNAME>/command      — прямой путь (часто запрещён ACL)
+//   read   devices/<FLAMINGO_HOSTNAME>/telemetry    — подтверждение состояния
+// Альтернатива без ACL: Node-RED bridge devices/+/out/flamingo → devices/esp32-flamingo/command
+
 // Supabase REST API (чтение уличных данных + запись комнатных)
 #define SUPABASE_URL     "https://your-project.supabase.co/rest/v1"
 #define SUPABASE_KEY     "your-supabase-anon-key"

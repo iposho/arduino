@@ -3,7 +3,7 @@
 
 #define WIFI_SSID        "your_wifi_ssid"
 #define WIFI_PASS        "your_wifi_password"
-#define DEVICE_HOSTNAME  "esp32-template"    // имя в роутере + MQTT device id
+#define DEVICE_HOSTNAME  "esp32-default"    // имя в роутере + MQTT device id
 
 // MQTT-шлюз esp32.kuzyak.in (Mosquitto на Raspberry Pi)
 #define MQTT_HOST        "192.168.100.43"

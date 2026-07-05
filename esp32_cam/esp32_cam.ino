@@ -10,11 +10,13 @@
 #include <esp_ota_ops.h>
 
 #include "esp_camera.h"
+#include "img_converters.h"
 #include "FS.h"
 #include "SD_MMC.h"
 
 #include "secrets.h"
 #include "firmware_info.h"
+#include "../include/ota_mqtt.h"
 
 // MQTT-топики (DEVICE_HOSTNAME из secrets.h):
 //   devices/<hostname>/status       — online/offline (LWT)
@@ -52,6 +54,7 @@ const unsigned long CAPTURE_INTERVAL_MS     = 15UL * 1000UL;
 const unsigned long MQTT_TELEMETRY_INTERVAL = 10UL * 1000UL;
 const unsigned long WIFI_RETRY_INTERVAL     = 30UL * 1000UL;
 const unsigned long NTP_GMT_OFFSET_SEC      = 4UL * 3600UL;
+const uint8_t JPEG_SAVE_QUALITY             = 8;
 
 #define MQTT_BUFFER_SIZE  4096
 #define FS_READ_MAX_BYTES 2800
@@ -97,7 +100,23 @@ const char *CAPABILITIES = R"CAP({
       "icon": "rotate-cw",
       "description": "ESP.restart()"
     }
-  ]
+  ],
+  "metrics": [
+    { "key": "ip", "label": "IP-адрес", "icon": "globe", "group": "Сеть", "dashboard": true, "order": 0 },
+    { "key": "rssi", "label": "Сигнал Wi-Fi", "icon": "signal", "format": "rssi", "group": "Сеть", "dashboard": true, "order": 1 },
+    { "key": "uptime", "label": "Аптайм", "icon": "clock", "format": "uptime", "group": "Система", "dashboard": true, "order": 2 },
+    { "key": "heap", "keys": ["heap", "free_heap"], "label": "Свободная RAM", "icon": "memory", "format": "bytes", "group": "Система", "dashboard": true, "order": 3 },
+    { "key": "sd_ready", "label": "SD-карта", "icon": "memory", "format": "boolean", "group": "Камера", "order": 10 },
+    { "key": "sd_free_mb", "label": "Свободно на SD", "icon": "gauge", "format": "number", "unit": "МБ", "group": "Камера", "dashboard": true, "order": 11 },
+    { "key": "last_capture_ok", "label": "Последний снимок", "icon": "camera", "format": "boolean", "group": "Камера", "dashboard": true, "order": 12 },
+    { "key": "capture_errors", "label": "Ошибки съёмки", "icon": "activity", "format": "number", "group": "Камера", "order": 13 },
+    { "key": "led", "label": "Вспышка", "icon": "zap", "format": "boolean", "group": "Камера", "order": 14 },
+    { "key": "fw_version", "label": "Версия прошивки", "icon": "cpu", "group": "Система", "order": 20 }
+  ],
+  "dashboard": {
+    "summary": ["last_capture_ok", "sd_free_mb", "rssi", "uptime"],
+    "max_items": 4
+  }
 })CAP";
 bool webServerStarted = false;
 
@@ -142,6 +161,8 @@ void restorePhotoIndex();
 void persistPhotoIndex();
 bool loadPhotoIndexFromFs();
 bool captureAndSavePhoto();
+bool encodePhotoJpeg(camera_fb_t* fb, uint8_t** outBuf, size_t* outLen);
+void formatCaptureTimestamp(char* buf, size_t len);
 void connectWiFi();
 void syncTime();
 void initMqttTopics();
@@ -204,6 +225,102 @@ String formatDateTime() {
   return String(buf);
 }
 
+void formatCaptureTimestamp(char* buf, size_t len) {
+  time_t now = time(nullptr);
+  if (now < 100000) {
+    buf[0] = '\0';
+    return;
+  }
+  struct tm* t = localtime(&now);
+  strftime(buf, len, "%Y-%m-%d %H:%M:%S", t);
+}
+
+// 5x7, только символы для "YYYY-MM-DD HH:MM:SS"
+static const char kTsFontChars[] = " 0123456789-:";
+static const uint8_t kTsFont[][5] PROGMEM = {
+  {0x00, 0x00, 0x00, 0x00, 0x00},
+  {0x3E, 0x51, 0x49, 0x45, 0x3E},
+  {0x00, 0x42, 0x7F, 0x40, 0x00},
+  {0x42, 0x61, 0x51, 0x49, 0x46},
+  {0x21, 0x41, 0x45, 0x4B, 0x31},
+  {0x18, 0x14, 0x12, 0x7F, 0x10},
+  {0x27, 0x45, 0x45, 0x45, 0x39},
+  {0x3C, 0x4A, 0x49, 0x49, 0x30},
+  {0x01, 0x71, 0x09, 0x05, 0x03},
+  {0x36, 0x49, 0x49, 0x49, 0x36},
+  {0x06, 0x49, 0x49, 0x29, 0x1E},
+  {0x08, 0x08, 0x08, 0x08, 0x08},
+  {0x00, 0x36, 0x36, 0x00, 0x00},
+};
+
+static void setPixel565(uint8_t* rgb, int width, int height, int x, int y, uint16_t color) {
+  if (x < 0 || y < 0 || x >= width || y >= height) return;
+  size_t idx = ((size_t)y * (size_t)width + (size_t)x) * 2;
+  rgb[idx] = color & 0xFF;
+  rgb[idx + 1] = color >> 8;
+}
+
+static void fillRect565(uint8_t* rgb, int width, int height,
+                        int x, int y, int w, int h, uint16_t color) {
+  for (int row = y; row < y + h; row++) {
+    for (int col = x; col < x + w; col++) {
+      setPixel565(rgb, width, height, col, row, color);
+    }
+  }
+}
+
+static const uint8_t* tsGlyphForChar(char c) {
+  const char* hit = strchr(kTsFontChars, c);
+  if (!hit) hit = kTsFontChars;
+  return kTsFont[hit - kTsFontChars];
+}
+
+static void drawTsChar565(uint8_t* rgb, int width, int height,
+                          int x, int y, char c, uint16_t fg, int scale) {
+  const uint8_t* glyph = tsGlyphForChar(c);
+  for (int col = 0; col < 5; col++) {
+    uint8_t bits = pgm_read_byte(&glyph[col]);
+    for (int row = 0; row < 7; row++) {
+      if (!(bits & (1 << row))) continue;
+      for (int sy = 0; sy < scale; sy++) {
+        for (int sx = 0; sx < scale; sx++) {
+          setPixel565(rgb, width, height, x + col * scale + sx, y + row * scale + sy, fg);
+        }
+      }
+    }
+  }
+}
+
+static void drawTimestamp565(uint8_t* rgb, int width, int height, const char* text) {
+  const int scale = 2;
+  const int margin = 10;
+  const int charStep = 6 * scale;
+  const int textW = (int)strlen(text) * charStep + 6;
+  const int textH = 7 * scale + 6;
+  const int x = margin;
+  const int y = height - textH - margin;
+
+  fillRect565(rgb, width, height, x - 3, y - 3, textW, textH, 0x0000);
+
+  int cx = x;
+  for (const char* p = text; *p; p++) {
+    drawTsChar565(rgb, width, height, cx, y, *p, 0xFFFF, scale);
+    cx += charStep;
+  }
+}
+
+bool encodePhotoJpeg(camera_fb_t* fb, uint8_t** outBuf, size_t* outLen) {
+  if (!fb || fb->format != PIXFORMAT_RGB565 || !outBuf || !outLen) return false;
+
+  char ts[24];
+  formatCaptureTimestamp(ts, sizeof(ts));
+  if (ts[0] != '\0') {
+    drawTimestamp565(fb->buf, fb->width, fb->height, ts);
+  }
+
+  return frame2jpg(fb, JPEG_SAVE_QUALITY, outBuf, outLen);
+}
+
 String photoPathForIndex(uint16_t index) {
   char path[48];
   snprintf(path, sizeof(path), "%s/%05u.jpg", PHOTOS_DIR, index % MAX_PHOTOS);
@@ -240,15 +357,13 @@ bool initCamera() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.frame_size = FRAMESIZE_HD;
-  config.pixel_format = PIXFORMAT_JPEG;
+  config.pixel_format = PIXFORMAT_RGB565;
   config.grab_mode = CAMERA_GRAB_LATEST;
   config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 12;
+  config.jpeg_quality = JPEG_SAVE_QUALITY;
   config.fb_count = 1;
 
   if (psramFound()) {
-    config.jpeg_quality = 10;
-    config.fb_count = 2;
     config.grab_mode = CAMERA_GRAB_LATEST;
   } else {
     config.frame_size = FRAMESIZE_VGA;
@@ -416,11 +531,26 @@ bool captureAndSavePhoto() {
     return false;
   }
 
-  size_t written = file.write(fb->buf, fb->len);
+  const uint8_t* writeBuf = nullptr;
+  size_t writeLen = 0;
+  uint8_t* jpegBuf = nullptr;
+
+  if (!encodePhotoJpeg(fb, &jpegBuf, &writeLen)) {
+    Serial.println("[Capture] jpeg encode failed");
+    esp_camera_fb_return(fb);
+    file.close();
+    lastCaptureOk = false;
+    captureErrors++;
+    return false;
+  }
+  writeBuf = jpegBuf;
+
+  size_t written = file.write(writeBuf, writeLen);
+  if (jpegBuf) free(jpegBuf);
   file.close();
   esp_camera_fb_return(fb);
 
-  if (written != fb->len) {
+  if (written != writeLen) {
     Serial.println("[Capture] write incomplete");
     lastCaptureOk = false;
     captureErrors++;
@@ -882,12 +1012,18 @@ String htmlOtaStep(const char* label, int step, int currentStep, bool failed, in
 }
 
 void publishOtaEvent(const char* phase, int progress) {
-  if (!mqttClient.connected()) return;
+  ensureMqtt();
 
   StaticJsonDocument<512> doc;
   doc["ota"] = phase;
   doc["ota_label"] = otaPhaseLabel(phase);
-  if (progress >= 0) doc["progress"] = progress;
+  if (progress >= 0) {
+    doc["progress"] = progress;
+  } else if (lastOtaProgress >= 0) {
+    doc["progress"] = lastOtaProgress;
+  } else {
+    doc["progress"] = 0;
+  }
   if (otaBytesTotal > 0) {
     doc["ota_bytes"] = otaBytesDone;
     doc["ota_total"] = otaBytesTotal;
@@ -910,8 +1046,10 @@ void publishOtaEvent(const char* phase, int progress) {
 
   char buf[512];
   size_t n = serializeJson(doc, buf);
-  mqttClient.publish(topicTelemetry, buf, n);
-  mqttClient.loop();
+  if (mqttClient.connected()) {
+    mqttClient.publish(topicTelemetry, buf, n);
+    mqttClient.loop();
+  }
 }
 
 void setOtaProgress(const char* phase, int progress, size_t current, size_t total) {
@@ -982,12 +1120,8 @@ void performOtaUpdate(const char* url) {
   lastOtaProgress = -1;
 
   setOtaProgress("preparing", 0, 0, 0);
+  ota_mqtt::bind(mqttClient, topicTelemetry, ensureMqtt, lastOtaProgress);
   publishOtaEvent("preparing", 0);
-
-  if (mqttClient.connected()) {
-    mqttClient.disconnect();
-    delay(200);
-  }
 
   releaseResourcesForOta();
 
@@ -998,8 +1132,8 @@ void performOtaUpdate(const char* url) {
     otaErrorMsg[sizeof(otaErrorMsg) - 1] = '\0';
     strncpy(otaFailedPhase, "preparing", sizeof(otaFailedPhase) - 1);
     otaFailedPhase[sizeof(otaFailedPhase) - 1] = '\0';
-    setOtaProgress("failed", -1, 0, 0);
-    publishOtaEvent("failed", -1);
+    setOtaProgress("failed", lastOtaProgress >= 0 ? lastOtaProgress : 0, 0, 0);
+    publishOtaEvent("failed", lastOtaProgress >= 0 ? lastOtaProgress : 0);
     setStatus("OTA failed: no partition");
     return;
   }
@@ -1044,8 +1178,8 @@ void performOtaUpdate(const char* url) {
     otaFailedPhase[sizeof(otaFailedPhase) - 1] = '\0';
     strncpy(otaErrorMsg, httpUpdate.getLastErrorString().c_str(), sizeof(otaErrorMsg) - 1);
     otaErrorMsg[sizeof(otaErrorMsg) - 1] = '\0';
-    setOtaProgress("failed", -1, otaBytesDone, otaBytesTotal);
-    publishOtaEvent("failed", -1);
+    setOtaProgress("failed", lastOtaProgress >= 0 ? lastOtaProgress : 0, otaBytesDone, otaBytesTotal);
+    publishOtaEvent("failed", lastOtaProgress >= 0 ? lastOtaProgress : 0);
   });
 
   t_httpUpdate_return ret;
@@ -1068,8 +1202,8 @@ void performOtaUpdate(const char* url) {
     }
     strncpy(otaErrorMsg, httpUpdate.getLastErrorString().c_str(), sizeof(otaErrorMsg) - 1);
     otaErrorMsg[sizeof(otaErrorMsg) - 1] = '\0';
-    setOtaProgress("failed", -1, otaBytesDone, otaBytesTotal);
-    publishOtaEvent("failed", -1);
+    setOtaProgress("failed", lastOtaProgress >= 0 ? lastOtaProgress : 0, otaBytesDone, otaBytesTotal);
+    publishOtaEvent("failed", lastOtaProgress >= 0 ? lastOtaProgress : 0);
   }
 }
 

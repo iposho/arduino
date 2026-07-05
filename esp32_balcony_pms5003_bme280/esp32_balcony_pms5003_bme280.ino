@@ -23,6 +23,7 @@
 // =====================
 #include "secrets.h"
 #include "firmware_info.h"
+#include "../include/ota_mqtt.h"
 
 // MQTT-топики (DEVICE_HOSTNAME из secrets.h):
 //   devices/<hostname>/status       — online/offline (LWT)
@@ -360,7 +361,25 @@ const char *CAPABILITIES = R"CAP({
       "icon": "rotate-cw",
       "description": "ESP.restart()"
     }
-  ]
+  ],
+  "metrics": [
+    { "key": "ip", "label": "IP-адрес", "icon": "globe", "group": "Сеть", "dashboard": true, "order": 0 },
+    { "key": "rssi", "label": "Сигнал Wi-Fi", "icon": "signal", "format": "rssi", "group": "Сеть", "dashboard": true, "order": 1 },
+    { "key": "uptime", "label": "Аптайм", "icon": "clock", "format": "uptime", "group": "Система", "dashboard": true, "order": 2 },
+    { "key": "heap", "keys": ["heap", "free_heap"], "label": "Свободная RAM", "icon": "memory", "format": "bytes", "group": "Система", "dashboard": true, "order": 3 },
+    { "key": "temperature", "label": "Температура", "icon": "thermometer", "format": "temperature", "unit": "°C", "group": "Климат", "dashboard": true, "order": 10 },
+    { "key": "humidity", "label": "Влажность", "icon": "droplets", "format": "percent", "group": "Климат", "dashboard": true, "order": 11 },
+    { "key": "pressure", "label": "Давление", "icon": "gauge", "format": "number", "unit": "мм рт.ст.", "group": "Климат", "order": 12 },
+    { "key": "pm25_median", "label": "PM2.5", "icon": "activity", "format": "number", "unit": "µg/m³", "group": "Воздух", "dashboard": true, "order": 20 },
+    { "key": "pm10_median", "label": "PM10", "icon": "activity", "format": "number", "unit": "µg/m³", "group": "Воздух", "order": 21 },
+    { "key": "pm1_median", "label": "PM1.0", "icon": "activity", "format": "number", "unit": "µg/m³", "group": "Воздух", "order": 22 },
+    { "key": "led", "label": "Светодиод", "icon": "lightbulb", "format": "boolean", "group": "Устройство", "order": 30 },
+    { "key": "fw_version", "label": "Версия прошивки", "icon": "cpu", "group": "Система", "order": 40 }
+  ],
+  "dashboard": {
+    "summary": ["pm25_median", "temperature", "humidity", "rssi"],
+    "max_items": 4
+  }
 })CAP";
 unsigned long lastMqttTelemetry = 0;
 
@@ -1501,16 +1520,7 @@ void showOtaScreen(const char* line1, const char* line2) {
 }
 
 void publishOtaEvent(const char* phase, int progress) {
-  if (!mqttClient.connected()) return;
-
-  StaticJsonDocument<192> doc;
-  doc["ota"] = phase;
-  if (progress >= 0) doc["progress"] = progress;
-
-  char buf[192];
-  size_t n = serializeJson(doc, buf);
-  mqttClient.publish(topicTelemetry, buf, n);
-  mqttClient.loop();
+  ota_mqtt::publish(phase, progress);
 }
 
 void queueOtaUpdate(const char* url) {
@@ -1522,8 +1532,12 @@ void queueOtaUpdate(const char* url) {
 void performOtaUpdate(const char* url) {
   Serial.printf("[OTA] starting: %s\n", url);
   showOtaScreen("Downloading...", url);
+
+  ota_mqtt::bind(mqttClient, topicTelemetry, ensureMqtt, lastOtaProgress);
   publishOtaEvent("starting", 0);
   lastOtaProgress = 0;
+
+  WiFi.setSleep(WIFI_PS_NONE);
 
   httpUpdate.rebootOnUpdate(true);
   httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
@@ -1531,16 +1545,16 @@ void performOtaUpdate(const char* url) {
   httpUpdate.onStart([]() {
     Serial.println("[OTA] start");
     esp_task_wdt_reset();
-    publishOtaEvent("downloading", 0);
     lastOtaProgress = 0;
+    publishOtaEvent("downloading", 0);
   });
 
   httpUpdate.onProgress([](size_t current, size_t total) {
     esp_task_wdt_reset();
     int pct = (total > 0) ? (int)((current * 100UL) / total) : 0;
-    Serial.printf("[OTA] %d%%\n", pct);
-    if (pct >= lastOtaProgress + 10 || pct == 100) {
+    if (pct >= lastOtaProgress + 1 || pct == 100 || lastOtaProgress < 0) {
       lastOtaProgress = pct;
+      Serial.printf("[OTA] %d%%\n", pct);
       publishOtaEvent("downloading", pct);
       char line[16];
       snprintf(line, sizeof(line), "%d%%", pct);
@@ -1551,6 +1565,7 @@ void performOtaUpdate(const char* url) {
   httpUpdate.onEnd([]() {
     Serial.println("[OTA] complete");
     esp_task_wdt_reset();
+    lastOtaProgress = 100;
     publishOtaEvent("rebooting", 100);
     showOtaScreen("Complete", "Rebooting...");
   });
@@ -1558,7 +1573,8 @@ void performOtaUpdate(const char* url) {
   httpUpdate.onError([](int error) {
     Serial.printf("[OTA] error %d: %s\n", error, httpUpdate.getLastErrorString().c_str());
     esp_task_wdt_reset();
-    publishOtaEvent("failed", -1);
+    int p = lastOtaProgress >= 0 ? lastOtaProgress : 0;
+    publishOtaEvent("failed", p);
     showOtaScreen("FAILED", httpUpdate.getLastErrorString().c_str());
   });
 
@@ -1574,6 +1590,8 @@ void performOtaUpdate(const char* url) {
 
   if (ret != HTTP_UPDATE_OK) {
     Serial.printf("[OTA] failed: %s\n", httpUpdate.getLastErrorString().c_str());
+    int p = lastOtaProgress >= 0 ? lastOtaProgress : 0;
+    publishOtaEvent("failed", p);
     showOtaScreen("FAILED", httpUpdate.getLastErrorString().c_str());
     eventLog.add("OTA FAIL");
     delay(3000);

@@ -1,0 +1,79 @@
+{
+  "schema": 1,
+  "note": "Коммитится в git. Папка ota/ в .gitignore — бинарники локальны; этот файл хранит последние собранные версии.",
+  "updated_at": "2026-07-05T20:41:46+04:00",
+  "devices": {
+    "flat": {
+      "sketch": "esp32_flat_bme280",
+      "version": "1.2.7",
+      "ota_basename": "esp32-flat.bin",
+      "partition": "default",
+      "last_build": {
+        "date": "20260705",
+        "file": "esp32-flat-1.2.7-20260705.bin",
+        "bytes": 1212480,
+        "sha256": "86f53322dbc722bb530900dcd065785169e3022c754fe3a786dca5af0827436c"
+      }
+    },
+    "balcony": {
+      "sketch": "esp32_balcony_pms5003_bme280",
+      "version": "1.1.4",
+      "ota_basename": "esp32-balcony.bin",
+      "partition": "default",
+      "last_build": {
+        "date": "20260705",
+        "file": "esp32-balcony-1.1.4-20260705.bin",
+        "bytes": 1200048,
+        "sha256": "d05779850808ee7b1418d9ef5caea4dbfa3c87ca1cdcfabfdb590d9c0f2abcb4"
+      }
+    },
+    "cam": {
+      "sketch": "esp32_cam",
+      "version": "1.1.7",
+      "ota_basename": "esp32-cam.bin",
+      "partition": "min_spiffs",
+      "last_build": {
+        "date": "20260705",
+        "file": "esp32-cam-1.1.7-20260705.bin",
+        "bytes": 1343040,
+        "sha256": "3b843da9cf23843f2a0ed1ab4ca5d61c3b829cb7ab2f51eaa70defb942e769c1"
+      }
+    },
+    "lamp": {
+      "sketch": "esp32_lamp",
+      "version": "1.2.1",
+      "ota_basename": "esp32-lamp.bin",
+      "partition": "default",
+      "last_build": {
+        "date": "20260705",
+        "file": "esp32-lamp-1.2.1-20260705.bin",
+        "bytes": 1085552,
+        "sha256": "1658702efafb558ea7abd9d95db770c1f573ba47e11fc57372a0632c0536e1d9"
+      }
+    },
+    "flamingo": {
+      "sketch": "esp32_flamingo",
+      "version": "1.0.4",
+      "ota_basename": "esp32-flamingo.bin",
+      "partition": "default",
+      "last_build": {
+        "date": "20260705",
+        "file": "esp32-flamingo-1.0.4-20260705.bin",
+        "bytes": 1086592,
+        "sha256": "ebc40e464ff244d559e3002728b601f5acce93ea9ad58d6e01d44381beb04518"
+      }
+    },
+    "default": {
+      "sketch": "esp32_default",
+      "version": "1.0.0",
+      "ota_basename": "esp32-default.bin",
+      "partition": "default",
+      "last_build": {
+        "date": "20260705",
+        "file": "esp32-default-1.0.0-20260705.bin",
+        "bytes": 1086336,
+        "sha256": "40cabc68fbbeac9be306d66e47e549ae1f4a6f65bad550afd3c38adc9bf0b9c7"
+      }
+    }
+  }
+}

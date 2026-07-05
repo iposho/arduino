@@ -1,0 +1,52 @@
+---
+description: Версионирование прошивок ESP32 и манифест OTA-релизов
+globs: "**/*.{ino,h,sh,json}"
+alwaysApply: true
+---
+
+# Версионирование прошивок
+
+Папка `ota/` в `.gitignore` — бинарники **не хранятся в git** и могут быть удалены в любой момент.
+
+## Источники правды
+
+| Что | Где |
+|-----|-----|
+| Текущая версия в коде | `FW_VERSION` в `include/firmware_info.h` и в `*/firmware_info.h` каждого скетча |
+| Последняя собранная версия | `include/firmware_manifest.json` (коммитится в git) |
+
+Перед работой с прошивкой смотри `include/firmware_manifest.json` — там последние `version`, `sha256` и имя `.bin` по каждому устройству.
+
+## При изменении прошивки (.ino, логика устройства)
+
+1. Подними `FW_VERSION` (semver: patch для фиксов, minor для фич) **во всех** файлах:
+   - `include/firmware_info.h`
+   - `<скетч>/firmware_info.h` затронутых устройств
+2. Обнови поле `"version"` в `include/firmware_manifest.json` для затронутых устройств.
+3. Закоммить изменения версии **вместе с кодом**, даже если `ota/` пуста или удалена.
+
+## После сборки OTA
+
+```bash
+./scripts/build-ota.sh          # все устройства
+./scripts/build-ota.sh cam      # одно устройство
+```
+
+`scripts/build-ota.sh` автоматически обновляет `last_build` в манифесте (дата, файл, bytes, sha256). Закоммить обновлённый `include/firmware_manifest.json` после релизной сборки.
+
+## Не делать
+
+- Не полагаться на наличие файлов в `ota/` — они локальные.
+- Не менять прошивку без bump версии (кроме чисто документационных правок).
+- Не забывать синхронизировать `FW_VERSION` между `include/` и папкой скетча.
+
+## Устройства
+
+| id | sketch | partition (OTA) |
+|----|--------|-----------------|
+| flat | esp32_flat_bme280 | default |
+| balcony | esp32_balcony_pms5003_bme280 | default |
+| cam | esp32_cam | **min_spiffs** (не Huge APP) |
+| lamp | esp32_lamp | default |
+| flamingo | esp32_flamingo | default |
+| default | esp32_default | default |
