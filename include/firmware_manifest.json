@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "note": "Коммитится в git. Папка ota/ в .gitignore — бинарники локальны; этот файл хранит последние собранные версии.",
-  "updated_at": "2026-09-18T02:09:41+04:00",
+  "updated_at": "2026-09-18T02:56:38+04:00",
   "devices": {
     "flat": {
       "sketch": "esp32_flat_bme280",
@@ -41,14 +41,14 @@
     },
     "flamingo": {
       "sketch": "esp32_flamingo",
-      "version": "1.0.11",
+      "version": "1.0.12",
       "ota_basename": "esp32-flamingo.bin",
       "partition": "default",
       "last_build": {
         "date": "20260918",
-        "file": "esp32-flamingo-1.0.11-20260918.bin",
-        "bytes": 1072912,
-        "sha256": "41d9c5a95daf5a78a8cb8888a9d4f6aeb1f8316d49ecafa215a3345200550f1a"
+        "file": "esp32-flamingo-1.0.12-20260918.bin",
+        "bytes": 1072896,
+        "sha256": "38dc1c404d392645aa5b736f65f0bde54d27e9fd560e9f6369b1e714207c86ea"
       }
     },
     "default": {

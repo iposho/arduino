@@ -461,7 +461,6 @@ void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
 
   if (strcmp(action, "sign") == 0 ||
       strcmp(action, "light") == 0 ||
-      strcmp(action, "lamp") == 0 ||
       strcmp(action, "relay") == 0) {
     if (doc["value"].is<bool>()) {
       setSignOn(doc["value"]);
