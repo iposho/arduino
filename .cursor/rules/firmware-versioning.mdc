@@ -40,6 +40,19 @@ alwaysApply: true
 - Не менять прошивку без bump версии (кроме чисто документационных правок).
 - Не забывать синхронизировать `FW_VERSION` между `include/` и папкой скетча.
 
+## Телеметрия MQTT (toggle-состояния)
+
+При изменении boolean-состояния, которое есть в `metrics` (`led`, `light`, `sign`, `garland` и т.д.):
+
+1. Вызывать `publishMqttTelemetry()` **сразу** после изменения — не ждать 10-секундный интервал.
+2. Вызывать `publishMqttTelemetry()` в `ensureMqtt()` сразу после успешного connect.
+
+Встроенный LED (GPIO 2): **выключен по умолчанию** (`boardLedOn = false`). Active LOW. Если дашборд показывает `led: true` после ребута — это устаревшее значение до первого пакета телеметрии.
+
+Подробнее: `AGENTS.md`, раздел «Телеметрия».
+
+Контекст для агентов: **`AGENTS.md`** в корне репозитория.
+
 ## Устройства
 
 | id | sketch | partition (OTA) |
@@ -47,6 +60,5 @@ alwaysApply: true
 | flat | esp32_flat_bme280 | default |
 | balcony | esp32_balcony_pms5003_bme280 | default |
 | cam | esp32_cam | **min_spiffs** (не Huge APP) |
-| lamp | esp32_lamp | default |
 | flamingo | esp32_flamingo | default |
 | default | esp32_default | default |

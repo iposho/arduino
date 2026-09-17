@@ -840,6 +840,7 @@ void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
       return;
     }
     Serial.printf("[MQTT] led %s\n", flashLedOn ? "on" : "off");
+    publishMqttTelemetry();
     return;
   }
 
@@ -919,6 +920,7 @@ void ensureMqtt() {
     Serial.printf("[MQTT] command  <- %s\n", topicCommand);
     Serial.printf("[MQTT] telemetry -> %s\n", topicTelemetry);
     setStatus("MQTT connected");
+    publishMqttTelemetry();
   } else {
     Serial.printf("[MQTT] connect failed, rc=%d\n", mqttClient.state());
   }

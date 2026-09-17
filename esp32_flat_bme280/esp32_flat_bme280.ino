@@ -820,6 +820,7 @@ void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
       return;
     }
     Serial.printf("[MQTT] led %s\n", boardLedOn ? "on" : "off");
+    publishMqttTelemetry();
     return;
   }
 
@@ -878,6 +879,7 @@ void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
       if (!isPinOutputCapable(pin)) return;
       if (pin == LED_BUILTIN) {
         setBoardLed(value != 0);
+        publishMqttTelemetry();
       } else {
         pinMode(pin, OUTPUT);
         digitalWrite(pin, value ? HIGH : LOW);
@@ -959,6 +961,7 @@ void ensureMqtt() {
     Serial.printf("[MQTT] command  <- %s\n", topicCommand);
     Serial.printf("[MQTT] telemetry -> %s\n", topicTelemetry);
     setStatus("MQTT connected");
+    publishMqttTelemetry();
   } else {
     Serial.printf("[MQTT] connect failed, rc=%d\n", mqttClient.state());
   }
@@ -1164,7 +1167,7 @@ void fetchWeatherFromSupabase() {
   Serial.println("Starting Supabase GET request...");
   HTTPClient http;
   String url = String(SUPABASE_URL) +
-    "/weather_logs?select=temperature,humidity,pressure,pm2_5,pm10_0&order=id.desc&limit=1";
+    "/weather_logs?select=temperature,ds18_temperature,humidity,pressure,pm2_5,pm10_0&order=id.desc&limit=1";
 
   http.begin(url);
   http.addHeader("apikey", SUPABASE_KEY);
@@ -1187,8 +1190,14 @@ void fetchWeatherFromSupabase() {
     if (!err && doc.is<JsonArray>() && doc.size() > 0) {
       Serial.println("JSON parse OK. Parsing fields...");
       JsonObject firstRow = doc[0];
-      
-      outTemp     = firstRow["temperature"].as<float>();
+
+      // Outdoor temp: предпочтительно DS18B20 (улица), иначе BME280
+      float bmeTemp = firstRow["temperature"].as<float>();
+      if (!firstRow["ds18_temperature"].isNull()) {
+        outTemp = firstRow["ds18_temperature"].as<float>();
+      } else {
+        outTemp = bmeTemp;
+      }
       outHumidity = firstRow["humidity"].as<float>();
       outPressure = firstRow["pressure"].as<float>();
       outPm25     = firstRow["pm2_5"].as<float>();
@@ -1199,8 +1208,8 @@ void fetchWeatherFromSupabase() {
       aqiDataValid = true;
 
       Serial.printf(
-        "Outdoor: %.1f C, %.1f mmHg, %.1f %%, PM2.5: %.1f, PM10: %.1f -> Calc AQI: %d\n",
-        outTemp, outPressure, outHumidity, outPm25, outPm10, aqiValue
+        "Outdoor: %.1f C (BME %.1f), %.1f mmHg, %.1f %%, PM2.5: %.1f, PM10: %.1f -> Calc AQI: %d\n",
+        outTemp, bmeTemp, outPressure, outHumidity, outPm25, outPm10, aqiValue
       );
 
       char timeBuf[8];

@@ -17,6 +17,8 @@
 #include <time.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
 
 // =====================
 // Секреты — вынесены в secrets.h (.gitignore)
@@ -36,6 +38,9 @@
 // =====================
 #define PMS_RX 16
 #define PMS_TX 17
+
+// DS18B20 (тестовый режим): DATA → GPIO 4 + подтяжка 4.7 kΩ к 3V3
+#define ONE_WIRE_BUS 4
 
 // Пины для RGB Светофора
 #define LED_R  25
@@ -224,8 +229,11 @@ TwoWire oledWire(1);
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &oledWire, OLED_RESET);
 PMS pms(Serial2);
 PMS::DATA data;
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature ds18(&oneWire);
 
 bool bmeReady   = false;
+bool ds18Ready  = false;
 bool pmsIsAwake = false;
 int  pmsErrorCount = 0;
 
@@ -248,7 +256,9 @@ const int CLIMATE_BUFFER_SIZE = 10;
 float tempBuffer[CLIMATE_BUFFER_SIZE];
 float humBuffer [CLIMATE_BUFFER_SIZE];
 float presBuffer[CLIMATE_BUFFER_SIZE];
+float ds18Buffer[CLIMATE_BUFFER_SIZE];
 int   climateBufferIndex = 0;
+int   ds18BufferIndex = 0;
 
 // Детекция залипших датчиков
 float lastBmeTemp = -999.0f;
@@ -315,6 +325,9 @@ float lastClimateHum  = 0.0f;
 float lastClimatePres = 0.0f;
 bool  hasClimateReading = false;
 
+float lastDs18Temp = 0.0f;
+bool  hasDs18Reading = false;
+
 WiFiClient mqttNet;
 PubSubClient mqttClient(mqttNet);
 
@@ -370,6 +383,7 @@ const char *CAPABILITIES = R"CAP({
     { "key": "temperature", "label": "Температура", "icon": "thermometer", "format": "temperature", "unit": "°C", "group": "Климат", "dashboard": true, "order": 10 },
     { "key": "humidity", "label": "Влажность", "icon": "droplets", "format": "percent", "group": "Климат", "dashboard": true, "order": 11 },
     { "key": "pressure", "label": "Давление", "icon": "gauge", "format": "number", "unit": "мм рт.ст.", "group": "Климат", "order": 12 },
+    { "key": "ds18_temperature", "label": "DS18B20", "icon": "thermometer", "format": "temperature", "unit": "°C", "group": "Климат", "order": 13 },
     { "key": "pm25_median", "label": "PM2.5", "icon": "activity", "format": "number", "unit": "µg/m³", "group": "Воздух", "dashboard": true, "order": 20 },
     { "key": "pm10_median", "label": "PM10", "icon": "activity", "format": "number", "unit": "µg/m³", "group": "Воздух", "order": 21 },
     { "key": "pm1_median", "label": "PM1.0", "icon": "activity", "format": "number", "unit": "µg/m³", "group": "Воздух", "order": 22 },
@@ -413,10 +427,12 @@ void    handleFsLs(const char* path);
 void    handleFsRead(const char* path);
 void    handleFsWrite(const char* path, const char* content);
 void    handleFsRm(const char* path);
-bool    sendDataToSupabase(float t, float h, float p);
+bool    sendDataToSupabase(float t, float h, float p, bool hasDs18, float ds18Temp);
 bool    pushClimateToSupabase();
 bool    readClimate(float &t, float &h, float &p);
+bool    readDs18(float &t);
 bool    isClimateValid(float t, float h, float p);
+bool    isDs18Valid(float t);
 float   getMedian(float* array, int size);
 String  pmsStatsJson(const char* prefix, PmsStats &s);
 void    setLedColor(bool r, bool g, bool y);
@@ -545,6 +561,25 @@ void setup() {
   eventLog.add(bmeReady ? "BME280 OK" : "BME280 FAIL");
   if (!bmeReady) logError("BME280 не найден при старте");
 
+  // --- DS18B20 (тестовый, GPIO 4) ---
+  ds18.begin();
+  ds18.setWaitForConversion(true);
+  ds18.setResolution(12);
+  int ds18Count = ds18.getDeviceCount();
+  ds18Ready = ds18Count > 0;
+  Serial.printf("[DS18B20] GPIO %d, найдено: %d\n", ONE_WIRE_BUS, ds18Count);
+  eventLog.add(ds18Ready ? "DS18B20 OK" : "DS18B20 FAIL");
+  if (!ds18Ready) {
+    Serial.println("[DS18B20] Нет датчиков. Нужна подтяжка 4.7k DATA→3V3.");
+  } else {
+    float dsT = 0;
+    if (readDs18(dsT)) {
+      lastDs18Temp = dsT;
+      hasDs18Reading = true;
+      Serial.printf("[DS18B20] Старт: %.2f °C\n", dsT);
+    }
+  }
+
   // --- PMS5003 ---
   Serial2.begin(9600, SERIAL_8N1, PMS_RX, PMS_TX);
   pms.passiveMode();
@@ -631,6 +666,9 @@ void setup() {
     Serial.print(buildRebootDebugBlock(rstReason));
     Serial.printf("  IP: %s, RSSI: %d dBm\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
     Serial.printf("  BME280: %s\n", bmeReady ? "OK" : "ОШИБКА");
+    Serial.printf("  DS18B20: %s", ds18Ready ? "OK" : "нет");
+    if (hasDs18Reading) Serial.printf(" %.2f C", lastDs18Temp);
+    Serial.println();
     float sT = 0, sH = 0, sP = 0;
     if (readClimate(sT, sH, sP)) {
       Serial.printf("  Климат: %.1f C, %.0f %%, %.1f mmHg\n", sT, sH, sP);
@@ -747,6 +785,18 @@ void loop() {
           lastBmeTemp = t;
         }
       }
+    }
+
+    // DS18B20 — тестовый буфер (независимо от BME)
+    float dsT;
+    if (readDs18(dsT)) {
+      if (ds18BufferIndex < CLIMATE_BUFFER_SIZE) {
+        ds18Buffer[ds18BufferIndex++] = dsT;
+      }
+      lastDs18Temp = dsT;
+      hasDs18Reading = true;
+      Serial.printf("[DS18B20] %.2f °C (buf %d/%d)\n",
+                    dsT, ds18BufferIndex, CLIMATE_BUFFER_SIZE);
     }
   }
 
@@ -975,6 +1025,36 @@ bool isClimateValid(float t, float h, float p) {
 }
 
 // ============================================================
+// DS18B20 helpers (тестовый режим)
+// ============================================================
+bool isDs18Valid(float t) {
+  if (isnan(t)) return false;
+  if (t == DEVICE_DISCONNECTED_C) return false;
+  if (t < -55.0f || t > 125.0f) return false;
+  return true;
+}
+
+bool readDs18(float &t) {
+  if (!ds18Ready) {
+    // повторный скан — датчик могли подключить позже
+    ds18.begin();
+    if (ds18.getDeviceCount() <= 0) return false;
+    ds18Ready = true;
+    ds18.setResolution(12);
+    Serial.println("[DS18B20] датчик появился на шине");
+    eventLog.add("DS18B20 OK");
+  }
+
+  ds18.requestTemperatures();
+  t = ds18.getTempCByIndex(0);
+  if (!isDs18Valid(t)) {
+    Serial.printf("[DS18B20] ошибка чтения (raw=%.2f)\n", t);
+    return false;
+  }
+  return true;
+}
+
+// ============================================================
 // Медиана (климатический буфер)
 // ============================================================
 float getMedian(float* array, int size) {
@@ -1019,15 +1099,33 @@ bool pushClimateToSupabase() {
     Serial.println("[Supabase] Нет климата — пропуск.");
     lastClimateSendTime = millis();
     climateBufferIndex = 0;
+    ds18BufferIndex = 0;
     return false;
   }
 
-  bool ok = sendDataToSupabase(fT, fH, fP);
+  bool hasDs18 = false;
+  float fDs18 = 0.0f;
+  if (ds18BufferIndex > 0) {
+    fDs18 = getMedian(ds18Buffer, ds18BufferIndex);
+    ds18BufferIndex = 0;
+    hasDs18 = true;
+  } else if (hasDs18Reading) {
+    fDs18 = lastDs18Temp;
+    hasDs18 = true;
+  } else {
+    float dsT;
+    if (readDs18(dsT)) {
+      fDs18 = dsT;
+      hasDs18 = true;
+    }
+  }
+
+  bool ok = sendDataToSupabase(fT, fH, fP, hasDs18, fDs18);
   lastClimateSendTime = millis();
   return ok;
 }
 
-bool sendDataToSupabase(float t, float h, float p) {
+bool sendDataToSupabase(float t, float h, float p, bool hasDs18, float ds18Temp) {
   if (WiFi.status() != WL_CONNECTED) return false;
 
   esp_task_wdt_reset();
@@ -1043,6 +1141,10 @@ bool sendDataToSupabase(float t, float h, float p) {
   json += "\"temperature\":"  + String(t, 2) + ",";
   json += "\"humidity\":"     + String(h, 2) + ",";
   json += "\"pressure\":"     + String(p, 2) + ",";
+  // Тестовое поле DS18B20 — нужна колонка ds18_temperature в weather_logs
+  if (hasDs18) {
+    json += "\"ds18_temperature\":" + String(ds18Temp, 2) + ",";
+  }
 
   if (hasPmsStats) {
     json += pmsStatsJson("pm1_0",  lastStatsPm1)  + ",";
@@ -1056,8 +1158,9 @@ bool sendDataToSupabase(float t, float h, float p) {
   }
   json += "}";
 
-  Serial.printf("[Supabase] T:%.1f H:%.0f P:%.1f PM2.5(med):%.0f (n:%d)\n",
+  Serial.printf("[Supabase] T:%.1f H:%.0f P:%.1f DS18:%.1f PM2.5(med):%.0f (n:%d)\n",
                 t, h, p,
+                hasDs18 ? ds18Temp : NAN,
                 hasPmsStats ? lastStatsPm25.median : 0.0f,
                 hasPmsStats ? lastStatsPm25.count  : 0);
   int code = http.POST(json);
@@ -1081,8 +1184,9 @@ bool sendDataToSupabase(float t, float h, float p) {
     supabaseTotalErrors++;
     Serial.printf("[Supabase] ОШИБКА %d (подряд: %d, всего: %d)\n",
                   code, supabaseErrorCount, supabaseTotalErrors);
-    Serial.printf("[Supabase] Потерянные данные: T:%.2f H:%.2f P:%.2f PM2.5:%.0f\n",
-                  t, h, p, hasPmsStats ? lastStatsPm25.median : 0.0f);
+    Serial.printf("[Supabase] Потерянные данные: T:%.2f H:%.2f P:%.2f DS18:%.2f PM2.5:%.0f\n",
+                  t, h, p, hasDs18 ? ds18Temp : NAN,
+                  hasPmsStats ? lastStatsPm25.median : 0.0f);
     char buf[LOG_ENTRY_LEN];
     snprintf(buf, sizeof(buf), "Supabase FAIL HTTP %d T:%.1f", code, t);
     logError(buf);
@@ -1366,6 +1470,7 @@ void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
       return;
     }
     Serial.printf("[MQTT] led %s\n", boardLedOn ? "on" : "off");
+    publishMqttTelemetry();
     return;
   }
 
@@ -1458,6 +1563,7 @@ void ensureMqtt() {
     Serial.printf("[MQTT] command  <- %s\n", topicCommand);
     Serial.printf("[MQTT] telemetry -> %s\n", topicTelemetry);
     eventLog.add("MQTT OK");
+    publishMqttTelemetry();
   } else {
     Serial.printf("[MQTT] connect failed, rc=%d\n", mqttClient.state());
   }
@@ -1468,11 +1574,12 @@ void publishMqttTelemetry() {
 
   esp_task_wdt_reset();
 
-  StaticJsonDocument<512> doc;
+  StaticJsonDocument<640> doc;
   doc["uptime"] = millis() / 1000UL;
   doc["heap"] = ESP.getFreeHeap();
   doc["min_heap"] = sessionMinHeap;
   doc["bme_ready"] = bmeReady;
+  doc["ds18_ready"] = ds18Ready;
   doc["led"] = boardLedOn;
   doc["oled_page"] = oledPage + 1;
   doc["overlay"] = oledStatusHold ? "status" : "";
@@ -1497,13 +1604,17 @@ void publishMqttTelemetry() {
     }
   }
 
+  if (hasDs18Reading) {
+    doc["ds18_temperature"] = lastDs18Temp;
+  }
+
   if (hasPmsStats) {
     doc["pm1_median"] = (int)lastStatsPm1.median;
     doc["pm25_median"] = (int)lastStatsPm25.median;
     doc["pm10_median"] = (int)lastStatsPm10.median;
   }
 
-  char buf[512];
+  char buf[640];
   size_t n = serializeJson(doc, buf);
   mqttClient.publish(topicTelemetry, buf, n);
 }
@@ -1732,9 +1843,16 @@ void updateOled(uint8_t page) {
       if (hasClimateReading) {
         display.printf("T:%5.1fC  H:%3.0f%%", lastClimateTemp, lastClimateHum);
         display.setCursor(0, 24);
-        display.printf("P:%6.1f mmHg", lastClimatePres);
+        display.printf("P:%6.1f", lastClimatePres);
+        if (hasDs18Reading) {
+          display.printf(" DS:%.1f", lastDs18Temp);
+        }
       } else {
         display.print(F("No readings yet"));
+        if (hasDs18Reading) {
+          display.setCursor(0, 24);
+          display.printf("DS18: %.1f C", lastDs18Temp);
+        }
       }
 
       oledDrawLine(34);
@@ -1828,6 +1946,14 @@ void updateOled(uint8_t page) {
       display.print(bmeReady ? F("OK") : F("FAIL"));
 
       display.setCursor(0, 24);
+      display.print(F("DS18:   "));
+      if (hasDs18Reading) {
+        display.printf("%.1fC", lastDs18Temp);
+      } else {
+        display.print(ds18Ready ? F("OK") : F("FAIL"));
+      }
+
+      display.setCursor(0, 34);
       display.print(F("PMS:    "));
       if (pmsSampling) {
         display.print(F("SAMPLING"));
@@ -1837,7 +1963,7 @@ void updateOled(uint8_t page) {
         display.print(F("SLEEP"));
       }
 
-      display.setCursor(0, 34);
+      display.setCursor(0, 44);
       display.print(F("WiFi:   "));
       if (WiFi.status() == WL_CONNECTED) {
         display.printf("OK %ddBm", WiFi.RSSI());
@@ -1847,22 +1973,11 @@ void updateOled(uint8_t page) {
         display.setTextColor(SSD1306_WHITE);
       }
 
-      oledDrawLine(44);
-
-      display.setCursor(0, 48);
+      display.setCursor(0, 54);
       if (WiFi.status() == WL_CONNECTED) {
         display.print(WiFi.localIP());
       } else {
         display.print(F("No network"));
-      }
-
-      display.setCursor(0, 58);
-      if (supabaseTotalErrors == 0 && bmeReady && pmsErrorCount == 0) {
-        display.print(F("ALL OK"));
-      } else {
-        display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
-        display.printf(" ERR:%d ", supabaseTotalErrors + (bmeReady ? 0 : 1));
-        display.setTextColor(SSD1306_WHITE);
       }
       break;
     }

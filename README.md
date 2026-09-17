@@ -2,7 +2,7 @@
 
 # Arduino / ESP32 Projects
 
-Домашние проекты на ESP32: мониторинг климата и качества воздуха, комнатный дисплей и камера с локальным архивом снимков. Все устройства публикуют телеметрию на MQTT-шлюз `esp32.kuzyak.in` (Mosquitto на Raspberry Pi).
+Домашние проекты на ESP32: мониторинг климата и качества воздуха, комнатный дисплей, камера с локальным архивом снимков, свет в спальне и декоративная вывеска. Все устройства публикуют телеметрию на MQTT-шлюз `esp32.kuzyak.in` (Mosquitto на Raspberry Pi).
 
 ## Архитектура
 
@@ -12,7 +12,7 @@ flowchart LR
     B[esp32-balcony]
     F[esp32-flat]
     C[esp32-cam]
-    L[esp32-lamp]
+    FG[esp32-flamingo]
   end
 
   subgraph hub [Шлюз]
@@ -26,7 +26,8 @@ flowchart LR
   B --> M
   F --> M
   C --> M
-  L --> M
+  FG --> M
+  F -->|relay sign| FG
   B --> S
   F --> S
   C -->|HTTP локально| U[Браузер / LAN]
@@ -35,11 +36,14 @@ flowchart LR
 | Топик | Назначение |
 |-------|------------|
 | `devices/<hostname>/status` | Online/offline (LWT) |
-| `devices/<hostname>/telemetry` | Периодическая телеметрия (каждые 10 с) |
+| `devices/<hostname>/telemetry` | Телеметрия: каждые 10 с + сразу при смене состояния |
 | `devices/<hostname>/command` | JSON-команды на устройство |
 | `devices/<hostname>/capabilities` | Retained JSON с описанием команд (для админки) |
+| `devices/esp32-flat/out/flamingo` | Relay flat → flamingo (кнопка вывески) |
 
 Общий формат команды: `{"action": "...", "value": ...}` (поле `value` — только где нужно).
+
+**Синхронизация состояния:** после любой toggle-команды (`led`, `light`, `sign`, `garland` …) и при MQTT-подключении устройство **сразу** публикует телеметрию — дашборд не ждёт до 10 с. Встроенный LED (GPIO 2) **выключен по умолчанию**; если UI показывает «вкл» после ребута — это устаревшее значение до первого пакета.
 
 ## Проекты
 
@@ -54,13 +58,13 @@ flowchart LR
 - Wi-Fi + MQTT сразу после прошивки
 - Телеметрия каждые 10 с (IP, RSSI, uptime, heap, версия)
 - Watchdog 30 с, автопереподключение Wi-Fi
-- OTA — можно сразу обновить на целевую прошивку (flat, lamp, …)
+- OTA — можно сразу обновить на целевую прошивку (flat, flamingo, …)
 
 **MQTT-команды:**
 
 | action | Описание |
 |--------|----------|
-| `led` + `value: bool` | Встроенный LED платы (GPIO 2) |
+| `led` + `value: bool` | Встроенный LED платы (GPIO 2); телеметрия сразу |
 | `status` | Немедленно опубликовать телеметрию |
 | `reboot` | Перезагрузка |
 | `ota` + `url: string` | OTA-обновление по HTTP(S) |
@@ -125,7 +129,7 @@ ESP32 DevKit + BME280 + PMS5003 + OLED SSD1306 128×64 + RGB-светофор.
 
 | action | Описание |
 |--------|----------|
-| `led` + `value: bool` | Встроенный LED платы (GPIO 2) |
+| `led` + `value: bool` | Встроенный LED платы (GPIO 2); телеметрия сразу |
 | `reboot` | Перезагрузка |
 | `status` | Показать страницу HW на OLED |
 | `ota` + `url: string` | OTA-обновление прошивки по HTTP(S) |
@@ -161,6 +165,7 @@ ESP32 DevKit + BME280 + 1.8" TFT ST7735 + джойстик.
 - Отправка локальных данных в Supabase каждые 10 минут
 - Загрузка уличных данных из Supabase каждые 10 минут
 - **MQTT** — телеметрия на шлюз
+- Кнопка GPIO 33 — переключение вывески esp32-flamingo (relay MQTT)
 
 **Удалённый мониторинг:** MQTT. Локального HTTP-интерфейса нет.
 
@@ -168,7 +173,7 @@ ESP32 DevKit + BME280 + 1.8" TFT ST7735 + джойстик.
 
 | action | Описание |
 |--------|----------|
-| `led` + `value: bool` | Встроенный LED платы (GPIO 2) |
+| `led` + `value: bool` | Встроенный LED платы (GPIO 2); телеметрия сразу |
 | `reboot` | Перезагрузка |
 | `status` | Показать экран System info |
 | `refresh` | Принудительно обновить данные с балкона |
@@ -188,6 +193,7 @@ ESP32 DevKit + BME280 + 1.8" TFT ST7735 + джойстик.
 | Joystick X | 34 |
 | Joystick Y | 35 |
 | Joystick SW | 32 |
+| Кнопка flamingo | 33 |
 
 **Плата:** ESP32 Dev Module, Partition = **Default** (4MB with spiffs, OTA).
 
@@ -212,7 +218,7 @@ AI-Thinker ESP32-CAM + microSD.
 |--------|----------|
 | `capture` | Внеочередной снимок |
 | `reboot` | Перезагрузка |
-| `led` + `value: bool` | Вспышка (GPIO 4) |
+| `led` + `value: bool` | Вспышка (GPIO 4); телеметрия сразу |
 | `ota` + `url: string` | OTA-обновление прошивки по HTTP(S) |
 
 **Пины (встроенные на плате):**
@@ -229,34 +235,27 @@ AI-Thinker ESP32-CAM + microSD.
 
 ---
 
-### 4. esp32_lamp — Управление светом
+### 4. esp32_flamingo — Неоновая вывеска «фламинго»
 
-ESP32 DevKit + LED-лампа на **2 провода** (красный/чёрный).
-
-**Подключение:**
-
-| Лампа | ESP32 |
-|-------|-------|
-| + (красный) | **GPIO 13** |
-| − (чёрный) | **GND** |
-
-Если лампа слишком яркая или греет GPIO — резистор **100–330 Ω** между GPIO 13 и «+».
-
-> Не вешайте на VIN/GND — с двумя проводами это только постоянное питание, без управления.
+ESP32 DevKit + неоновая вывеска на GPIO 13 (PWM) + гирлянда на GPIO 33 + стробоскоп на GPIO 25 + кнопка на GPIO 27.
 
 - **MQTT** — телеметрия и команды на шлюз
-- OTA-обновление прошивки
-- Автопереподключение Wi-Fi
+- Вывеска: PWM 0–255 на GPIO 13 (`sign`, `brightness`)
+- Гирлянда: вкл/выкл на GPIO 33 (`garland`)
+- Стробоскоп: вкл/выкл на GPIO 25 (`strobe`)
+- **Кнопка** (GPIO 27 → GND, INPUT_PULLUP): одиночное нажатие — гирлянда вкл/выкл, двойное — стробоскоп вкл/выкл
+- Кнопка на **esp32-flat** (GPIO 33) переключает вывеску через relay-топик `devices/esp32-flat/out/flamingo` (ACL брокера не пускает flat в `command` flamingo напрямую)
+- Flat подписан на `devices/esp32-flamingo/telemetry` и подтверждает состояние `sign`
 
 **MQTT-команды:**
 
 | action | Описание |
 |--------|----------|
-| `light` или `lamp` + `value: bool/int` | Включить/выключить лампу (GPIO 13) |
-| `pin_write` + `pin: 13`, `value: 0/1` | То же через GPIO (как на других устройствах) |
-| `pin_read` + `pin: N` | Прочитать пин, ответ в telemetry |
-| `pin_mode` + `pin`, `mode` | `OUTPUT` / `INPUT` / `INPUT_PULLUP` |
-| `led` + `value: bool` | Встроенный LED платы (GPIO 2) |
+| `sign` + `value: bool` | Вкл/выкл вывеску (GPIO 13); телеметрия сразу |
+| `brightness` + `value: 0–255` | Яркость PWM; телеметрия сразу |
+| `garland` + `value: bool` | Вкл/выкл гирлянду (GPIO 33; кнопка: одно нажатие); телеметрия сразу |
+| `strobe` + `value: bool` | Вкл/выкл стробоскоп (GPIO 25; кнопка: двойное нажатие); телеметрия сразу |
+| `led` + `value: bool` | Встроенный LED платы (GPIO 2); телеметрия сразу |
 | `reboot` | Перезагрузка |
 | `ota` + `url: string` | OTA-обновление прошивки по HTTP(S) |
 
@@ -264,11 +263,18 @@ ESP32 DevKit + LED-лампа на **2 провода** (красный/чёрн
 
 | Компонент | GPIO |
 |-----------|------|
-| Лампа + | 13 |
-| Лампа − | GND |
+| Вывеска + | 13 (PWM) |
+| Вывеска − | GND |
+| Гирлянда + | 33 |
+| Гирлянда − | GND |
+| Стробоскоп + | 25 |
+| Стробоскоп − | GND |
+| Кнопка | 27 → GND |
 | LED встроенный | 2 |
 
 **Плата:** ESP32 Dev Module, Partition = **Default** (4MB with spiffs, OTA).
+
+---
 
 ## Настройка
 
@@ -281,15 +287,15 @@ ESP32 DevKit + LED-лампа на **2 провода** (красный/чёрн
 | esp32_balcony | ✓ | ✓ | ✓ |
 | esp32_flat | ✓ | ✓ | ✓ |
 | esp32_cam | ✓ | ✓ | — |
-| esp32_lamp | ✓ | ✓ | — |
+| esp32_flamingo | ✓ | ✓ | — |
 | esp32_default | ✓ | ✓ | — |
 
 `DEVICE_HOSTNAME` используется как имя в роутере и как MQTT device id.
 
 ### 2. Библиотеки (Arduino Library Manager)
 
-| Библиотека | Балкон | Комната | Камера | Лампа | Default |
-|------------|:------:|:-------:|:------:|:-----:|:-------:|
+| Библиотека | Балкон | Комната | Камера | Flamingo | Default |
+|------------|:------:|:-------:|:------:|:--------:|:-------:|
 | Adafruit BME280 Library | ✓ | ✓ | | | |
 | Adafruit GFX Library | ✓ | ✓ | | | |
 | Adafruit SSD1306 | ✓ | | | | |
@@ -320,21 +326,49 @@ ESP32 DevKit + LED-лампа на **2 провода** (красный/чёрн
 
 > **Важно:** для OTA нужна схема разделов с двумя слотами приложения (`app0` + `app1`). Схема **Huge APP** OTA не поддерживает. Если устройство прошито через USB со схемой Huge APP — один раз перепрошейте по USB с **Default**, дальше обновления пойдут по OTA.
 
+### Troubleshooting: USB-прошивка
+
+#### `Failed to connect to ESP32: Wrong boot mode detected (0xb)`
+
+Чип **не в download mode** — esptool увидел обычный запуск из flash (режим `0xb`), а не загрузчик. Сборка прошла успешно; проблема только в подключении к ROM bootloader.
+
+**Что сделать (по порядку):**
+
+1. **Закройте Serial Monitor** (и любые другие программы на этом порту) — занятый порт часто мешает auto-reset.
+2. **Ручной вход в download mode** (самый надёжный способ на DevKit):
+   - зажмите **BOOT** (GPIO0 → GND);
+   - коротко нажмите **EN/RESET**;
+   - отпустите **BOOT**;
+   - сразу нажмите Upload в IDE.
+3. Если auto-reset срабатывает нестабильно: **держите BOOT нажатым** с момента «Connecting…» до появления «Writing…», затем отпустите.
+4. **Кабель и порт:** только data-кабель (не «только зарядка»), другой USB-порт / другой кабель. На macOS порт обычно `/dev/cu.usbserial-*` или `/dev/cu.wchusbserial*` (CH340).
+5. В Arduino IDE → Tools: **Upload Speed** снизьте до **115200** (иногда помогает на длинных/дешёвых кабелях).
+6. Убедитесь, что выбран правильный **Board** и **Port**; для обычных DevKit — **ESP32 Dev Module**.
+
+**ESP32-CAM (без кнопок BOOT/EN на модуле):** перед Upload замкните **IO0 → GND**, нажмите Reset (или подайте питание), прошейте, разомкните IO0, снова Reset. Удобнее — плата с кнопками (например, MB/programmer).
+
+**Если ничего не помогает:** отключите периферию с GPIO0 / GPIO2 / GPIO12 / GPIO15 (strapping pins) — занятый GPIO0 не даёт войти в download mode.
+
+Официальная справка Espressif: [esptool troubleshooting](https://docs.espressif.com/projects/esptool/en/latest/troubleshooting.html).
+
 ### 4. Сборка OTA-бинарников
 
 Скрипт `scripts/build-ota.sh` собирает прошивки через `arduino-cli` (из PATH или из Arduino IDE) и кладёт готовые `.bin` в `ota/`. Имя файла: `<устройство>-<версия>-<дата>.bin` (версия из `firmware_info.h`, дата — день сборки).
 
-| Цель | Плата | Partition | Пример файла |
-|------|-------|-----------|--------------|
-| `flat` | ESP32 Dev Module | Default | `ota/esp32-flat-1.1.0-20260704.bin` |
-| `balcony` | ESP32 Dev Module | Default | `ota/esp32-balcony-1.1.0-20260704.bin` |
-| `cam` | AI Thinker ESP32-CAM | min_spiffs | `ota/esp32-cam-1.1.0-20260704.bin` |
-| `lamp` | ESP32 Dev Module | Default | `ota/esp32-lamp-1.1.0-20260704.bin` |
-| `default` | ESP32 Dev Module | Default | `ota/esp32-default-1.0.0-20260704.bin` |
+| Цель | Плата | Partition | Версия* | Пример файла |
+|------|-------|-----------|---------|--------------|
+| `flat` | ESP32 Dev Module | Default | 1.2.9 | `ota/esp32-flat-1.2.9-20260730.bin` |
+| `balcony` | ESP32 Dev Module | Default | 1.2.0 | `ota/esp32-balcony-1.2.0-20260730.bin` |
+| `cam` | AI Thinker ESP32-CAM | min_spiffs | 1.1.8 | `ota/esp32-cam-1.1.8-20260706.bin` |
+| `flamingo` | ESP32 Dev Module | Default | 1.0.11 | `ota/esp32-flamingo-1.0.11-20260918.bin` |
+| `default` | ESP32 Dev Module | Default | 1.0.1 | `ota/esp32-default-1.0.1-20260706.bin` |
+
+\* Актуальные версии — в `include/firmware_manifest.json`.
 
 ```bash
 ./scripts/build-ota.sh              # все проекты
 ./scripts/build-ota.sh flat         # только комнатный дисплей
+./scripts/build-ota.sh flamingo     # только вывеска
 ./scripts/build-ota.sh balcony cam  # балкон + камера
 ```
 
@@ -342,7 +376,15 @@ ESP32 DevKit + LED-лампа на **2 провода** (красный/чёрн
 
 Переменная `ARDUINO_CLI` переопределяет путь к CLI, если он не в PATH и Arduino IDE установлена нестандартно.
 
+> **Зависает сборка на „Detecting libraries used...“?** Обычно виноват повреждённый кэш скетча (остался после прерванного запуска). Удалите его и соберите снова:
+> ```bash
+> rm -rf ~/Library/Caches/arduino/sketches/*
+> ```
+> Также не запускайте `build-ota.sh` в фоне (`&`) — при прерывании он оставляет битый кэш, и следующие сборки этого скетча зависают.
+
 **Версионирование:** папка `ota/` в `.gitignore` — бинарники локальные и могут быть удалены. Последние собранные версии (номер, дата, sha256) хранятся в **`include/firmware_manifest.json`** (коммитится в git). При изменении прошивки поднимайте `FW_VERSION` в `firmware_info.h` и обновляйте манифест; `build-ota.sh` дописывает `last_build` автоматически.
+
+Контекст для LLM-агентов: **`AGENTS.md`**.
 
 ## Структура репозитория
 
@@ -355,8 +397,10 @@ arduino/
 │   └── update-firmware-manifest.py # Обновление include/firmware_manifest.json
 ├── include/
 │   ├── firmware_info.h             # FW_VERSION и телеметрия
-│   └── firmware_manifest.json      # Последние OTA-сборки (в git, не ota/)
+│   ├── firmware_manifest.json      # Последние OTA-сборки (в git, не ota/)
+│   └── ota_mqtt.h                  # OTA-прогресс в telemetry
 ├── ota/                            # Готовые .bin для OTA (.gitignore)
+├── AGENTS.md                       # Контекст для LLM-агентов
 ├── esp32_balcony_pms5003_bme280/   # Балконная метеостанция
 │   ├── esp32_balcony_pms5003_bme280.ino
 │   ├── build/                      # Артефакты компиляции (.gitignore)
@@ -377,8 +421,8 @@ arduino/
 │   ├── build/                      # (.gitignore)
 │   ├── secrets.h                   # (.gitignore)
 │   └── secrets.example.h
-├── esp32_lamp/                     # Управление светом по MQTT
-│   ├── esp32_lamp.ino
+├── esp32_flamingo/                 # Неоновая вывеска + гирлянда + стробоскоп + кнопка
+│   ├── esp32_flamingo.ino
 │   ├── build/                      # (.gitignore)
 │   ├── secrets.h                   # (.gitignore)
 │   └── secrets.example.h

@@ -1,78 +1,66 @@
 {
   "schema": 1,
   "note": "Коммитится в git. Папка ota/ в .gitignore — бинарники локальны; этот файл хранит последние собранные версии.",
-  "updated_at": "2026-07-05T20:41:46+04:00",
+  "updated_at": "2026-09-18T02:09:41+04:00",
   "devices": {
     "flat": {
       "sketch": "esp32_flat_bme280",
-      "version": "1.2.7",
+      "version": "1.2.9",
       "ota_basename": "esp32-flat.bin",
       "partition": "default",
       "last_build": {
-        "date": "20260705",
-        "file": "esp32-flat-1.2.7-20260705.bin",
-        "bytes": 1212480,
-        "sha256": "86f53322dbc722bb530900dcd065785169e3022c754fe3a786dca5af0827436c"
+        "date": "20260730",
+        "file": "esp32-flat-1.2.9-20260730.bin",
+        "bytes": 1193712,
+        "sha256": "34412ca187fcd4360dbc2cbf1c514508937862162fe3e8ac271b6c877e1843a4"
       }
     },
     "balcony": {
       "sketch": "esp32_balcony_pms5003_bme280",
-      "version": "1.1.4",
+      "version": "1.2.0",
       "ota_basename": "esp32-balcony.bin",
       "partition": "default",
       "last_build": {
-        "date": "20260705",
-        "file": "esp32-balcony-1.1.4-20260705.bin",
-        "bytes": 1200048,
-        "sha256": "d05779850808ee7b1418d9ef5caea4dbfa3c87ca1cdcfabfdb590d9c0f2abcb4"
+        "date": "20260730",
+        "file": "esp32-balcony-1.2.0-20260730.bin",
+        "bytes": 1187472,
+        "sha256": "e16b25122c4f51186164ed7369e12337e25a9be835d1c3f6194ef19bc0b4b9ed"
       }
     },
     "cam": {
       "sketch": "esp32_cam",
-      "version": "1.1.7",
+      "version": "1.1.8",
       "ota_basename": "esp32-cam.bin",
       "partition": "min_spiffs",
       "last_build": {
-        "date": "20260705",
-        "file": "esp32-cam-1.1.7-20260705.bin",
-        "bytes": 1343040,
-        "sha256": "3b843da9cf23843f2a0ed1ab4ca5d61c3b829cb7ab2f51eaa70defb942e769c1"
-      }
-    },
-    "lamp": {
-      "sketch": "esp32_lamp",
-      "version": "1.2.1",
-      "ota_basename": "esp32-lamp.bin",
-      "partition": "default",
-      "last_build": {
-        "date": "20260705",
-        "file": "esp32-lamp-1.2.1-20260705.bin",
-        "bytes": 1085552,
-        "sha256": "1658702efafb558ea7abd9d95db770c1f573ba47e11fc57372a0632c0536e1d9"
+        "date": "20260706",
+        "file": "esp32-cam-1.1.8-20260706.bin",
+        "bytes": 1343056,
+        "sha256": "f24d75c62bc4a1d8818fbe537f6bee73d54ee54abd5d1b31371610eaf11c6778"
       }
     },
     "flamingo": {
       "sketch": "esp32_flamingo",
-      "version": "1.0.4",
+      "version": "1.0.11",
       "ota_basename": "esp32-flamingo.bin",
       "partition": "default",
       "last_build": {
-        "date": "20260705",
-        "file": "esp32-flamingo-1.0.4-20260705.bin",
-        "bytes": 1086592,
-        "sha256": "ebc40e464ff244d559e3002728b601f5acce93ea9ad58d6e01d44381beb04518"
+        "date": "20260918",
+        "file": "esp32-flamingo-1.0.11-20260918.bin",
+        "bytes": 1072912,
+        "sha256": "41d9c5a95daf5a78a8cb8888a9d4f6aeb1f8316d49ecafa215a3345200550f1a"
       }
     },
     "default": {
       "sketch": "esp32_default",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "ota_basename": "esp32-default.bin",
       "partition": "default",
       "last_build": {
-        "date": "20260705",
-        "file": "esp32-default-1.0.0-20260705.bin",
-        "bytes": 1086336,
-        "sha256": "40cabc68fbbeac9be306d66e47e549ae1f4a6f65bad550afd3c38adc9bf0b9c7"
+        "date": "20260706",
+        "file": "esp32-default-1.0.1-20260706.bin",
+        "bytes": 1086368,
+        "sha256": "f0dee611dabbf5c51e5a4922e6c388d5b86b11619f80a927bb0cb43db0d8b396"
       }
     }
   }

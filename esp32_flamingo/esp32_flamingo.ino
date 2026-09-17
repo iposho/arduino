@@ -30,12 +30,27 @@
 #define LED_BUILTIN 2
 #endif
 
-// Неоновая вывеска «фламинго» на 2 провода (+/−), как esp32_lamp:
+// Неоновая вывеска «фламинго» на 2 провода (+/−):
 //   (+) красный  → GPIO 13
 //   (−) чёрный   → GND
 // Яркость — PWM на GPIO 13 (0 = выкл, 1–255 = диммирование).
 #define SIGN_PIN           13
 #define SIGN_DEFAULT_LEVEL 255
+
+// Гирлянда на GPIO 33: (+) → GPIO 33, (−) → GND. HIGH = вкл.
+#define GARLAND_PIN 33
+
+// Стробоскоп на GPIO 25: (+) → GPIO 25, (−) → GND. HIGH = вкл.
+#define STROBE_PIN  25
+
+// Двухтактная кнопка (2 провода): GPIO 27 → кнопка → GND. INPUT_PULLUP.
+//   одно нажатие — гирлянда вкл/выкл
+//   двойное      — стробоскоп вкл/выкл
+#define BUTTON_PIN          27
+#define BUTTON_DEBOUNCE_MS  60UL    // антидребезг (не «удержание»!)
+#define BUTTON_DOUBLE_MS    350UL   // окно двойного нажатия
+
+// =====================
 
 // =====================
 // Intervals
@@ -75,6 +90,20 @@ const char *CAPABILITIES = R"CAP({
       "description": "PWM 0–255 на GPIO13 (0 = выкл)"
     },
     {
+      "action": "garland",
+      "title": "Гирлянда",
+      "type": "toggle",
+      "icon": "tree-pine",
+      "description": "Вкл/выкл гирлянду на GPIO33 (кнопка: одно нажатие)"
+    },
+    {
+      "action": "strobe",
+      "title": "Стробоскоп",
+      "type": "toggle",
+      "icon": "zap",
+      "description": "Вкл/выкл стробоскоп на GPIO25 (кнопка: двойное нажатие)"
+    },
+    {
       "action": "led",
       "title": "Светодиод",
       "type": "toggle",
@@ -96,18 +125,28 @@ const char *CAPABILITIES = R"CAP({
     { "key": "heap", "keys": ["heap", "free_heap"], "label": "Свободная RAM", "icon": "memory", "format": "bytes", "group": "Система", "dashboard": true, "order": 3 },
     { "key": "sign", "label": "Вывеска", "icon": "sparkles", "format": "boolean", "group": "Устройство", "dashboard": true, "order": 4 },
     { "key": "brightness", "label": "Яркость", "icon": "sun", "format": "number", "unit": "%", "group": "Устройство", "dashboard": true, "order": 5 },
+    { "key": "garland", "label": "Гирлянда", "icon": "tree-pine", "format": "boolean", "group": "Устройство", "dashboard": true, "order": 6 },
+    { "key": "strobe", "label": "Стробоскоп", "icon": "zap", "format": "boolean", "group": "Устройство", "dashboard": true, "order": 7 },
     { "key": "led", "label": "Светодиод", "icon": "circle", "format": "boolean", "group": "Устройство", "order": 10 },
     { "key": "fw_version", "label": "Версия прошивки", "icon": "cpu", "group": "Система", "order": 20 }
   ],
   "dashboard": {
-    "summary": ["sign", "brightness", "rssi", "uptime"],
+    "summary": ["sign", "garland", "strobe", "brightness"],
     "max_items": 4
   }
 })CAP";
 
 bool boardLedOn = false;
 bool signOn = false;
+bool garlandOn = false;
+bool strobeOn = false;
 uint8_t signLevel = 0;
+
+// Кнопка
+bool btnLastRead = HIGH;
+bool btnStable = HIGH;
+unsigned long btnLastChangeMs = 0;
+unsigned long btnLastPressMs = 0;   // время нажатия — для окна двойного клика (0 = нет)
 
 char statusLine[64] = "Booting";
 
@@ -126,6 +165,10 @@ void setBoardLed(bool on);
 void applySignOutput();
 void setSignOn(bool on);
 void setSignLevel(uint8_t level);
+void setGarland(bool on);
+void setStrobe(bool on);
+void handleButton();
+void checkButtonSingle();
 void connectWiFi();
 void initMqttTopics();
 void ensureMqtt();
@@ -178,6 +221,61 @@ void setSignLevel(uint8_t level) {
   signLevel = level;
   signOn = level > 0;
   applySignOutput();
+}
+
+void setGarland(bool on) {
+  garlandOn = on;
+  digitalWrite(GARLAND_PIN, on ? HIGH : LOW);
+  Serial.printf("[Garland] %s\n", on ? "ON" : "OFF");
+}
+
+void setStrobe(bool on) {
+  strobeOn = on;
+  digitalWrite(STROBE_PIN, on ? HIGH : LOW);
+  Serial.printf("[Strobe] %s\n", on ? "ON" : "OFF");
+}
+
+// =====================
+// Кнопка: один клик — гирлянда, двойной — стробоскоп
+// =====================
+void handleButton() {
+  bool reading = digitalRead(BUTTON_PIN);
+  unsigned long now = millis();
+
+  // Антидребезг: ждём, пока пин устоится
+  if (reading != btnLastRead) {
+    btnLastRead = reading;
+    btnLastChangeMs = now;
+    return;
+  }
+  if (now - btnLastChangeMs < BUTTON_DEBOUNCE_MS) return;
+  if (reading == btnStable) return;   // состояния не изменилось
+
+  btnStable = reading;
+
+  // Реагируем только на НАЖАТИЕ
+  if (btnStable == LOW) {
+    if (btnLastPressMs != 0 && (now - btnLastPressMs) <= BUTTON_DOUBLE_MS) {
+      // Второе нажатие в окне — двойной клик
+      btnLastPressMs = 0;
+      Serial.println("[Button] Double press → strobe");
+      setStrobe(!strobeOn);
+      publishMqttTelemetry();
+    } else {
+      btnLastPressMs = now;
+      Serial.println("[Button] Press");
+    }
+  }
+}
+
+// Одиночное нажатие — срабатывает, если второе не пришло в окне
+void checkButtonSingle() {
+  if (btnLastPressMs != 0 && (millis() - btnLastPressMs > BUTTON_DOUBLE_MS)) {
+    btnLastPressMs = 0;
+    Serial.println("[Button] Single press → garland");
+    setGarland(!garlandOn);
+    publishMqttTelemetry();
+  }
 }
 
 int parseBrightnessValue(JsonVariant value) {
@@ -254,6 +352,26 @@ void handlePinWrite(uint8_t pin, int value) {
       setSignOn(value != 0);
     } else {
       setSignLevel(constrain(value, 0, 255));
+    }
+    Serial.printf("[MQTT] pin_write pin=%u value=%d\n", pin, value);
+    return;
+  }
+
+  if (pin == GARLAND_PIN) {
+    if (value <= 1) {
+      setGarland(value != 0);
+    } else {
+      setGarland(value > 0);
+    }
+    Serial.printf("[MQTT] pin_write pin=%u value=%d\n", pin, value);
+    return;
+  }
+
+  if (pin == STROBE_PIN) {
+    if (value <= 1) {
+      setStrobe(value != 0);
+    } else {
+      setStrobe(value > 0);
     }
     Serial.printf("[MQTT] pin_write pin=%u value=%d\n", pin, value);
     return;
@@ -363,6 +481,26 @@ void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
+  if (strcmp(action, "garland") == 0) {
+    if (doc["value"].is<bool>()) {
+      setGarland(doc["value"]);
+    } else if (doc["value"].is<int>()) {
+      setGarland(doc["value"] != 0);
+    }
+    publishMqttTelemetry();
+    return;
+  }
+
+  if (strcmp(action, "strobe") == 0) {
+    if (doc["value"].is<bool>()) {
+      setStrobe(doc["value"]);
+    } else if (doc["value"].is<int>()) {
+      setStrobe(doc["value"] != 0);
+    }
+    publishMqttTelemetry();
+    return;
+  }
+
   if (strcmp(action, "led") == 0) {
     if (doc["value"].is<bool>()) {
       setBoardLed(doc["value"]);
@@ -370,6 +508,7 @@ void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
       setBoardLed(doc["value"] != 0);
     }
     Serial.printf("[MQTT] led %s\n", boardLedOn ? "on" : "off");
+    publishMqttTelemetry();
     return;
   }
 
@@ -448,6 +587,7 @@ void ensureMqtt() {
     Serial.printf("[MQTT] relay    <- %s\n", topicFlatRelay);
     Serial.printf("[MQTT] telemetry -> %s\n", topicTelemetry);
     setStatus("MQTT connected");
+    publishMqttTelemetry();
   } else {
     Serial.printf("[MQTT] connect failed, rc=%d\n", mqttClient.state());
   }
@@ -461,6 +601,8 @@ void publishMqttTelemetry() {
   doc["heap"] = ESP.getFreeHeap();
   doc["sign"] = signOn;
   doc["brightness"] = signOn ? (signLevel * 100 + 127) / 255 : 0;
+  doc["garland"] = garlandOn;
+  doc["strobe"] = strobeOn;
   doc["led"] = boardLedOn;
   addNetworkTelemetry(doc);
   addFirmwareTelemetry(doc);
@@ -507,7 +649,17 @@ void setup() {
   setBoardLed(false);
 
   pinMode(SIGN_PIN, OUTPUT);
+  pinMode(GARLAND_PIN, OUTPUT);
+  pinMode(STROBE_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
   setSignLevel(0);
+  setGarland(false);
+  setStrobe(false);
+
+  btnLastRead = digitalRead(BUTTON_PIN);
+  btnStable = btnLastRead;
+  btnLastChangeMs = millis();
+  btnLastPressMs = 0;
 
   Serial.begin(115200);
   delay(500);
@@ -527,6 +679,9 @@ void loop() {
     return;
   }
 
+  handleButton();
+  checkButtonSingle();
+
   unsigned long now = millis();
 
   if (WiFi.status() != WL_CONNECTED) {
@@ -544,5 +699,5 @@ void loop() {
     }
   }
 
-  delay(50);
+  delay(10);
 }

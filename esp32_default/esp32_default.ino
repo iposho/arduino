@@ -2,7 +2,7 @@
  * ESP32 Default — универсальная прошивка для любой ESP32 DevKit.
  *
  * Прошейте по USB на новую плату: Wi-Fi, MQTT, телеметрия и стандартные команды
- * работают сразу. Потом OTA-обновите на целевую прошивку (flat, lamp, …).
+ * работают сразу. Потом OTA-обновите на целевую прошивку (flat, flamingo, …).
  *
  * Библиотеки (Arduino Library Manager): PubSubClient, ArduinoJson
  *
@@ -255,6 +255,7 @@ void handlePinWrite(uint8_t pin, int value) {
     if (!isPinOutputCapable(pin)) return;
     if (pin == LED_BUILTIN) {
       setBoardLed(value != 0);
+      publishMqttTelemetry();
     } else {
       pinMode(pin, OUTPUT);
       digitalWrite(pin, value ? HIGH : LOW);
@@ -347,6 +348,7 @@ void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
       setBoardLed(doc["value"] != 0);
     }
     Serial.printf("[MQTT] led %s\n", boardLedOn ? "on" : "off");
+    publishMqttTelemetry();
     return;
   }
 

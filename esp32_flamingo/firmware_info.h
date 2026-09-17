@@ -4,7 +4,7 @@
 #include <ArduinoJson.h>
 
 #ifndef FW_VERSION
-#define FW_VERSION "1.0.4"
+#define FW_VERSION "1.0.11"
 #endif
 
 #define FW_BUILD_DATE __DATE__
