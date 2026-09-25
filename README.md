@@ -2,7 +2,7 @@
 
 # Arduino / ESP32 Projects
 
-Домашние проекты на ESP32: мониторинг климата и качества воздуха, комнатный дисплей, камера с локальным архивом снимков, свет в спальне и декоративная вывеска. Все устройства публикуют телеметрию на MQTT-шлюз `esp32.kuzyak.in` (Mosquitto на Raspberry Pi).
+Домашние проекты на ESP32: мониторинг климата и качества воздуха, комнатный дисплей и декоративная вывеска. Все устройства публикуют телеметрию на MQTT-шлюз `esp32.kuzyak.in` (Mosquitto на Raspberry Pi).
 
 ## Архитектура
 
@@ -11,7 +11,6 @@ flowchart LR
   subgraph devices [ESP32-устройства]
     B[esp32-balcony]
     F[esp32-flat]
-    C[esp32-cam]
     FG[esp32-flamingo]
   end
 
@@ -25,12 +24,10 @@ flowchart LR
 
   B --> M
   F --> M
-  C --> M
   FG --> M
   F -->|relay sign| FG
   B --> S
   F --> S
-  C -->|HTTP локально| U[Браузер / LAN]
 ```
 
 | Топик | Назначение |
@@ -199,43 +196,7 @@ ESP32 DevKit + BME280 + 1.8" TFT ST7735 + джойстик.
 
 ---
 
-### 3. esp32_cam — Камера с фото на SD
-
-AI-Thinker ESP32-CAM + microSD.
-
-- Снимок каждые **15 секунд**, сохранение JPEG на microSD (`/photos/00000.jpg` … `00479.jpg`)
-- Кольцевая ротация: 480 кадров (~2 часа), старые перезаписываются
-- Разрешение **SVGA** (800×600), JPEG quality 10–12
-- **MQTT** — телеметрия и команды через шлюз
-- **HTTP** — статус-страница и раздача фото:
-  - `http://esp32-cam.local/` — статус + превью (автообновление 10 с)
-  - `http://esp32-cam.local/latest.jpg` — последний кадр
-  - `http://esp32-cam.local/photo?id=N` — кадр по индексу (0–479)
-
-**MQTT-команды:**
-
-| action | Описание |
-|--------|----------|
-| `capture` | Внеочередной снимок |
-| `reboot` | Перезагрузка |
-| `led` + `value: bool` | Вспышка (GPIO 4); телеметрия сразу |
-| `ota` + `url: string` | OTA-обновление прошивки по HTTP(S) |
-
-**Пины (встроенные на плате):**
-
-| Компонент | GPIO |
-|-----------|------|
-| Камера OV2640 | 0, 5, 18–23, 25–27, 32, 34–39 |
-| microSD (1-bit) | CLK 14, CMD 15, D0 2 |
-| Вспышка | 4 |
-
-**Прошивка:** Board = **AI Thinker ESP32-CAM**, Partition = **Minimal SPIFFS (1.9MB APP with OTA/128KB SPIFFS)**. microSD — **FAT32**.
-
-> У ESP32-CAM в Arduino IDE по умолчанию стоит **Huge APP** — OTA там не работает. Прошивка камеры ~1.3 МБ, поэтому обычный Default (слот 1.2 МБ) тоже не подходит — нужен именно **min_spiffs**.
-
----
-
-### 4. esp32_flamingo — Неоновая вывеска «фламинго»
+### 3. esp32_flamingo — Неоновая вывеска «фламинго»
 
 ESP32 DevKit + неоновая вывеска на GPIO 13 (PWM) + гирлянда на GPIO 33 + стробоскоп на GPIO 25 + кнопка на GPIO 27.
 
@@ -286,7 +247,6 @@ ESP32 DevKit + неоновая вывеска на GPIO 13 (PWM) + гирлян
 |--------|-------|------|----------|
 | esp32_balcony | ✓ | ✓ | ✓ |
 | esp32_flat | ✓ | ✓ | ✓ |
-| esp32_cam | ✓ | ✓ | — |
 | esp32_flamingo | ✓ | ✓ | — |
 | esp32_default | ✓ | ✓ | — |
 
@@ -294,17 +254,15 @@ ESP32 DevKit + неоновая вывеска на GPIO 13 (PWM) + гирлян
 
 ### 2. Библиотеки (Arduino Library Manager)
 
-| Библиотека | Балкон | Комната | Камера | Flamingo | Default |
-|------------|:------:|:-------:|:------:|:--------:|:-------:|
-| Adafruit BME280 Library | ✓ | ✓ | | | |
-| Adafruit GFX Library | ✓ | ✓ | | | |
-| Adafruit SSD1306 | ✓ | | | | |
-| Adafruit ST7735 and ST7789 Library | | ✓ | | | |
-| PMS Library | ✓ | | | | |
-| ArduinoJson | ✓ | ✓ | ✓ | ✓ | ✓ |
-| PubSubClient | ✓ | ✓ | ✓ | ✓ | ✓ |
-
-Камера использует встроенные `esp_camera` и `SD_MMC` (ESP32 Arduino core).
+| Библиотека | Балкон | Комната | Flamingo | Default |
+|------------|:------:|:-------:|:--------:|:-------:|
+| Adafruit BME280 Library | ✓ | ✓ | | |
+| Adafruit GFX Library | ✓ | ✓ | | |
+| Adafruit SSD1306 | ✓ | | | |
+| Adafruit ST7735 and ST7789 Library | | ✓ | | |
+| PMS Library | ✓ | | | |
+| ArduinoJson | ✓ | ✓ | ✓ | ✓ |
+| PubSubClient | ✓ | ✓ | ✓ | ✓ |
 
 ### 3. Прошивка
 
@@ -345,8 +303,6 @@ ESP32 DevKit + неоновая вывеска на GPIO 13 (PWM) + гирлян
 5. В Arduino IDE → Tools: **Upload Speed** снизьте до **115200** (иногда помогает на длинных/дешёвых кабелях).
 6. Убедитесь, что выбран правильный **Board** и **Port**; для обычных DevKit — **ESP32 Dev Module**.
 
-**ESP32-CAM (без кнопок BOOT/EN на модуле):** перед Upload замкните **IO0 → GND**, нажмите Reset (или подайте питание), прошейте, разомкните IO0, снова Reset. Удобнее — плата с кнопками (например, MB/programmer).
-
 **Если ничего не помогает:** отключите периферию с GPIO0 / GPIO2 / GPIO12 / GPIO15 (strapping pins) — занятый GPIO0 не даёт войти в download mode.
 
 Официальная справка Espressif: [esptool troubleshooting](https://docs.espressif.com/projects/esptool/en/latest/troubleshooting.html).
@@ -359,7 +315,6 @@ ESP32 DevKit + неоновая вывеска на GPIO 13 (PWM) + гирлян
 |------|-------|-----------|---------|--------------|
 | `flat` | ESP32 Dev Module | Default | 1.2.9 | `ota/esp32-flat-1.2.9-20260730.bin` |
 | `balcony` | ESP32 Dev Module | Default | 1.2.0 | `ota/esp32-balcony-1.2.0-20260730.bin` |
-| `cam` | AI Thinker ESP32-CAM | min_spiffs | 1.1.8 | `ota/esp32-cam-1.1.8-20260706.bin` |
 | `flamingo` | ESP32 Dev Module | Default | 1.0.12 | `ota/esp32-flamingo-1.0.12-20260918.bin` |
 | `default` | ESP32 Dev Module | Default | 1.0.1 | `ota/esp32-default-1.0.1-20260706.bin` |
 
@@ -369,7 +324,7 @@ ESP32 DevKit + неоновая вывеска на GPIO 13 (PWM) + гирлян
 ./scripts/build-ota.sh              # все проекты
 ./scripts/build-ota.sh flat         # только комнатный дисплей
 ./scripts/build-ota.sh flamingo     # только вывеска
-./scripts/build-ota.sh balcony cam  # балкон + камера
+./scripts/build-ota.sh balcony flat # балкон + комната
 ```
 
 Требуется `secrets.h` в папке проекта. Для OTA нужен только файл приложения (`.ino.bin`), не полный образ flash.
@@ -408,11 +363,6 @@ arduino/
 │   └── secrets.example.h
 ├── esp32_flat_bme280/              # Комнатный дисплей
 │   ├── esp32_flat_bme280.ino
-│   ├── build/                      # (.gitignore)
-│   ├── secrets.h                   # (.gitignore)
-│   └── secrets.example.h
-├── esp32_cam/                      # ESP32-CAM, фото на SD
-│   ├── esp32_cam.ino
 │   ├── build/                      # (.gitignore)
 │   ├── secrets.h                   # (.gitignore)
 │   └── secrets.example.h

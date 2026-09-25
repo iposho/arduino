@@ -27,18 +27,6 @@
         "sha256": "e16b25122c4f51186164ed7369e12337e25a9be835d1c3f6194ef19bc0b4b9ed"
       }
     },
-    "cam": {
-      "sketch": "esp32_cam",
-      "version": "1.1.8",
-      "ota_basename": "esp32-cam.bin",
-      "partition": "min_spiffs",
-      "last_build": {
-        "date": "20260706",
-        "file": "esp32-cam-1.1.8-20260706.bin",
-        "bytes": 1343056,
-        "sha256": "f24d75c62bc4a1d8818fbe537f6bee73d54ee54abd5d1b31371610eaf11c6778"
-      }
-    },
     "flamingo": {
       "sketch": "esp32_flamingo",
       "version": "1.0.12",

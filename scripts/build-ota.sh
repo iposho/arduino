@@ -10,7 +10,7 @@ fi
 #   ./scripts/build-ota.sh flat      — только esp32_flat_bme280
 #   ./scripts/build-ota.sh flamingo  — только esp32_flamingo
 #   ./scripts/build-ota.sh default   — только esp32_default
-#   ./scripts/build-ota.sh balcony cam
+#   ./scripts/build-ota.sh balcony flat
 
 set -euo pipefail
 
@@ -66,7 +66,6 @@ ota_filename() {
 PROJECTS=(
   "flat|esp32_flat_bme280|esp32:esp32:esp32:PartitionScheme=default|esp32.esp32.esp32|esp32-flat.bin|default"
   "balcony|esp32_balcony_pms5003_bme280|esp32:esp32:esp32:PartitionScheme=default|esp32.esp32.esp32|esp32-balcony.bin|default"
-  "cam|esp32_cam|esp32:esp32:esp32cam:PartitionScheme=min_spiffs|esp32.esp32.esp32cam|esp32-cam.bin|min_spiffs"
   "flamingo|esp32_flamingo|esp32:esp32:esp32:PartitionScheme=default|esp32.esp32.esp32|esp32-flamingo.bin|default"
   "default|esp32_default|esp32:esp32:esp32:PartitionScheme=default|esp32.esp32.esp32|esp32-default.bin|default"
 )
@@ -145,7 +144,7 @@ main() {
   done
 
   if [[ $built -eq 0 ]]; then
-    echo "Ничего не собрано. Доступные цели: flat, balcony, cam, flamingo, default" >&2
+    echo "Ничего не собрано. Доступные цели: flat, balcony, flamingo, default" >&2
     exit 1
   fi
 

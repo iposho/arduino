@@ -29,7 +29,7 @@ alwaysApply: true
 
 ```bash
 ./scripts/build-ota.sh          # все устройства
-./scripts/build-ota.sh cam      # одно устройство
+./scripts/build-ota.sh flat     # одно устройство
 ```
 
 `scripts/build-ota.sh` автоматически обновляет `last_build` в манифесте (дата, файл, bytes, sha256). Закоммить обновлённый `include/firmware_manifest.json` после релизной сборки.
@@ -59,6 +59,5 @@ alwaysApply: true
 |----|--------|-----------------|
 | flat | esp32_flat_bme280 | default |
 | balcony | esp32_balcony_pms5003_bme280 | default |
-| cam | esp32_cam | **min_spiffs** (не Huge APP) |
 | flamingo | esp32_flamingo | default |
 | default | esp32_default | default |

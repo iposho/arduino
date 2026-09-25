@@ -1,6 +1,6 @@
 # AGENTS.md — контекст для LLM
 
-Домашние прошивки ESP32: климат, дисплей, камера, декоративная вывеска. Все устройства публикуют MQTT на `esp32.kuzyak.in`.
+Домашние прошивки ESP32: климат, дисплей, декоративная вывеска. Все устройства публикуют MQTT на `esp32.kuzyak.in`.
 
 ## Быстрые ссылки
 
@@ -20,7 +20,6 @@
 | default | `esp32-default` | `esp32_default` | default | Универсальная заготовка для новой платы |
 | flat | `esp32-flat` | `esp32_flat_bme280` | default | Комнатный TFT + BME280/AHT/ENS160 |
 | balcony | `esp32-balcony` | `esp32_balcony_pms5003_bme280` | default | Балкон: BME280 + PMS5003 + OLED |
-| cam | `esp32-cam` | `esp32_cam` | **min_spiffs** | ESP32-CAM, фото на SD |
 | flamingo | `esp32-flamingo` | `esp32_flamingo` | default | Вывеска PWM GPIO 13 + гирлянда GPIO 33 + стробоскоп GPIO 25 + кнопка GPIO 27 |
 
 ## MQTT
@@ -47,7 +46,6 @@
 
 - **По умолчанию выключен** (`boardLedOn = false`, `setBoardLed(false)` в `setup()`).
 - Active **LOW** на большинстве DevKit: `digitalWrite(LED_BUILTIN, on ? LOW : HIGH)`.
-- Исключение: **cam** — поле `led` в телеметрии = вспышка GPIO 4 (active HIGH).
 - Краткое мигание при загрузке только в `esp32_default` (`blinkBootLed()`).
 
 ### Команда `status` — разная семантика
@@ -56,7 +54,7 @@
 |-------|----------------------|
 | default | Немедленно публикует телеметрию |
 | flat, balcony | Показывает системный экран на дисплее |
-| flamingo, cam | Команды нет в capabilities |
+| flamingo | Команды нет в capabilities |
 
 ## Изменение прошивки
 
@@ -72,10 +70,13 @@
 - Flamingo подписан на свой `command` и на relay-топик flat.
 - Flat подписан на `devices/esp32-flamingo/telemetry` и синхронизирует `flamingoSignOn` перед toggle кнопкой.
 
+## Выведенные из эксплуатации
+
+`esp32_cam` удалён из репозитория (2026-09). Плата ESP32-CAM теперь работает как `esp32-bird-cam` (кормушка) — её прошивка **не** в этом репозитории; не прошивать её скетчами отсюда. Ранее удалены `esp32_lamp`, `esp32_cam_stream`, `esp32_growbox`, `esp32_bedroom`. В шлюзе их `device_id` лежат в `deleted_devices` — так и должно быть.
+
 ## Типичные ошибки (не повторять)
 
 - Добавить toggle-команду без немедленного `publishMqttTelemetry()`.
 - Забыть `publishMqttTelemetry()` в `ensureMqtt()` после connect.
 - Считать, что `led` включён по умолчанию — в коде всегда `false`; «включён» в UI = устаревшая телеметрия.
 - Путать GPIO 33: кнопка на flat (вывеска), гирлянда на flamingo.
-- Для cam использовать partition Huge APP или Default — нужен **min_spiffs**.
