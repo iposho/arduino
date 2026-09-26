@@ -1480,7 +1480,10 @@ void releaseResourcesForOta() {
 
 bool otaUpdateAvailable(size_t* slotSizeOut) {
   const esp_partition_t* next = esp_ota_get_next_update_partition(nullptr);
-  if (!next) return false;
+  // Huge APP: единственный слот app0 (ota_0), и «следующий» слот — это текущий.
+  // Update.begin() тогда падает с «Partition Could Not be Found» уже после скачивания,
+  // поэтому ловим это заранее и отдаём понятную ошибку про min_spiffs.
+  if (!next || next == esp_ota_get_running_partition()) return false;
   if (slotSizeOut) *slotSizeOut = next->size;
   return true;
 }
