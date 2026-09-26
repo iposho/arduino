@@ -408,6 +408,15 @@ bool encodePhotoJpeg(uint8_t** outBuf, size_t* outLen, bool* outAllocated) {
     return true;
   }
 
+  // jpg2rgb565 отдаёт RGB565 в обратном порядке байт относительно того, что ждёт
+  // fmt2jpg (порядок сенсора). Без перестановки снимок на SD выходит «кислотным»:
+  // младшие биты зелёного попадают в старшие разряды — радужные полосы вместо градиентов.
+  for (size_t i = 0; i + 1 < rgbLen; i += 2) {
+    uint8_t t = rgb[i];
+    rgb[i] = rgb[i + 1];
+    rgb[i + 1] = t;
+  }
+
   drawTimestamp565(rgb, w, h, ts);
   bool ok = fmt2jpg(rgb, rgbLen, w, h, PIXFORMAT_RGB565, JPEG_SAVE_QUALITY, outBuf, outLen);
   free(rgb);
