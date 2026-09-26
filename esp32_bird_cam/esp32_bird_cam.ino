@@ -56,8 +56,11 @@ const unsigned long FRAME_INTERVAL_NIGHT_MS = 30UL * 1000UL;
 const unsigned long MQTT_TELEMETRY_INTERVAL = 10UL * 1000UL;
 const unsigned long WIFI_RETRY_INTERVAL     = 30UL * 1000UL;
 const unsigned long NTP_GMT_OFFSET_SEC      = 4UL * 3600UL;
+// Шкалы качества разные: у аппаратного JPEG сенсора 0..63 и меньше — лучше,
+// у программного кодировщика (frame2jpg / fmt2jpg) 1..100 и больше — лучше.
 const uint8_t JPEG_STREAM_QUALITY           = 12;  // аппаратный JPEG сенсора, SVGA ≈ 30–50 КБ
-const uint8_t JPEG_SAVE_QUALITY             = 10;  // перекодирование снимка с меткой времени для SD
+const uint8_t JPEG_SOFT_QUALITY             = 80;  // программный JPEG: живой кадр в режиме RGB565, VGA ≈ 40–60 КБ
+const uint8_t JPEG_SAVE_QUALITY             = 85;  // программный JPEG: снимок с меткой времени для SD
 
 // =====================
 // Детектор птиц (без нейронки): разница кадра 1/8 (100×75) с медленным фоном
@@ -72,6 +75,15 @@ const uint8_t  DAYLIGHT_LUMA_OFF = 30;             // стало темно (г�
 const uint8_t  MOTION_PIXEL_DIFF = 28;             // порог изменения пикселя (0..255)
 const uint16_t MOTION_TRIGGER_PERMILLE  = 20;      // ≥2% пикселей изменилось — движение
 const uint16_t MOTION_LIGHTING_PERMILLE = 450;     // ≥45% — облако/экспозиция, сброс фона
+// Птица — небольшое пятно: изменилось больше 20% зоны — это человек, рука
+// или сдвинутая камера, визитом не считается
+const uint16_t MOTION_MAX_BIRD_PERMILLE = 200;
+// Зона кормушки в процентах кадра: детектор смотрит только внутрь неё.
+// По умолчанию весь кадр; сузить, когда камера встанет у кормушки.
+const uint8_t MOTION_ROI_LEFT_PCT   = 0;
+const uint8_t MOTION_ROI_TOP_PCT    = 0;
+const uint8_t MOTION_ROI_RIGHT_PCT  = 100;
+const uint8_t MOTION_ROI_BOTTOM_PCT = 100;
 const uint8_t  MOTION_CONFIRM_FRAMES    = 2;       // подряд, чтобы отсечь шум JPEG
 const unsigned long BIRD_VISIT_GAP_MS   = 60UL * 1000UL;  // тишина дольше — следующий визит новый
 const unsigned long BIRD_SAVE_INTERVAL_MS = 10UL * 1000UL; // на SD не чаще раза в 10 с
@@ -753,7 +765,7 @@ bool grabFrame() {
   if (fb->format != PIXFORMAT_JPEG) {
     uint8_t* jpg = nullptr;
     size_t jpgLen = 0;
-    bool ok = frame2jpg(fb, JPEG_STREAM_QUALITY, &jpg, &jpgLen);
+    bool ok = frame2jpg(fb, JPEG_SOFT_QUALITY, &jpg, &jpgLen);
     esp_camera_fb_return(fb);
     ok = ok && storeFrame(jpg, jpgLen);
     if (jpg) free(jpg);
@@ -767,13 +779,23 @@ bool grabFrame() {
   return ok;
 }
 
-static uint16_t countChangedPermille(const uint8_t* cur, const uint8_t* bg, size_t n) {
+// Доля изменившихся пикселей (‰) внутри зоны кормушки MOTION_ROI_*
+static uint16_t countChangedPermille(const uint8_t* cur, const uint8_t* bg, uint16_t w, uint16_t h) {
+  const uint16_t x0 = (uint32_t)w * MOTION_ROI_LEFT_PCT / 100;
+  const uint16_t x1 = max<uint16_t>(x0 + 1, (uint32_t)w * MOTION_ROI_RIGHT_PCT / 100);
+  const uint16_t y0 = (uint32_t)h * MOTION_ROI_TOP_PCT / 100;
+  const uint16_t y1 = max<uint16_t>(y0 + 1, (uint32_t)h * MOTION_ROI_BOTTOM_PCT / 100);
   size_t changed = 0;
-  for (size_t i = 0; i < n; i++) {
-    int d = (int)cur[i] - (int)bg[i];
-    if (d > MOTION_PIXEL_DIFF || d < -MOTION_PIXEL_DIFF) changed++;
+  size_t total = 0;
+  for (uint16_t y = y0; y < y1 && y < h; y++) {
+    for (uint16_t x = x0; x < x1 && x < w; x++) {
+      const size_t i = (size_t)y * w + x;
+      int d = (int)cur[i] - (int)bg[i];
+      if (d > MOTION_PIXEL_DIFF || d < -MOTION_PIXEL_DIFF) changed++;
+      total++;
+    }
   }
-  return (uint16_t)((changed * 1000UL) / n);
+  return total ? (uint16_t)((changed * 1000UL) / total) : 0;
 }
 
 // Фон подтягивается к текущему кадру: быстро в покое, медленно при движении
@@ -857,10 +879,13 @@ void analyzeFrame(unsigned long now) {
     return;
   }
 
-  // RGB565 big-endian (порядок байт декодера esp32-camera) → яркость.
+  // jpg2rgb565 отдаёт RGB565 младшим байтом вперёд (см. encodePhotoJpeg).
+  // При чтении старшим байтом вперёд шум младших битов зелёного попадал в
+  // старшие разряды «яркости»: неподвижная сцена давала ~100‰ изменений,
+  // и каждые 10 с писался ложный «визит».
   uint32_t lumaSum = 0;
   for (size_t i = 0; i < n; i++) {
-    uint16_t c = ((uint16_t)motionRgb[i * 2] << 8) | motionRgb[i * 2 + 1];
+    uint16_t c = (uint16_t)motionRgb[i * 2] | ((uint16_t)motionRgb[i * 2 + 1] << 8);
     uint8_t r = (c >> 11) << 3;
     uint8_t g = ((c >> 5) & 0x3F) << 2;
     uint8_t b = (c & 0x1F) << 3;
@@ -897,7 +922,7 @@ void analyzeFrame(unsigned long now) {
     return;
   }
 
-  motionPermille = countChangedPermille(motionGray, motionBg, n);
+  motionPermille = countChangedPermille(motionGray, motionBg, motionW, motionH);
 
   if (!daylight || motionPermille >= MOTION_LIGHTING_PERMILLE) {
     // Ночь или резкая смена освещения — это не птица, просто новый фон.
@@ -907,7 +932,8 @@ void analyzeFrame(unsigned long now) {
     return;
   }
 
-  bool moving = motionPermille >= MOTION_TRIGGER_PERMILLE;
+  // Слишком крупное изменение — не птица (человек, рука, сдвинули камеру)
+  bool moving = motionPermille >= MOTION_TRIGGER_PERMILLE && motionPermille <= MOTION_MAX_BIRD_PERMILLE;
   motionStreak = moving ? (motionStreak < 255 ? motionStreak + 1 : 255) : 0;
   blendBackground(motionBg, motionGray, n, moving ? 5 : 3);
 
@@ -1841,7 +1867,7 @@ void handleStatusPage() {
   html += htmlRow("Сенсор", String(sensorName) + (camRgbMode ? " · RGB565 VGA" : " · JPEG SVGA"));
   html += htmlRow("Светло", daylight ? "Да" : "Нет (ночной режим)", daylight ? "ok" : "warn");
   html += htmlRow("Яркость", String(frameLuma));
-  html += htmlRow("Движение", String(motionPermille) + "‰" + (motionNow ? " — птица" : ""),
+  html += htmlRow("Движение", String(motionPermille) + "‰" + (motionNow ? " — движение" : ""),
                   motionNow ? "ok" : "");
   html += htmlRow("Визитов сегодня", String(birdVisitsToday));
   if (birdLastAt > 0) {
