@@ -10,7 +10,8 @@ fi
 #   ./scripts/build-ota.sh flat      — только esp32_flat_bme280
 #   ./scripts/build-ota.sh flamingo  — только esp32_flamingo
 #   ./scripts/build-ota.sh default   — только esp32_default
-#   ./scripts/build-ota.sh balcony flat
+#   ./scripts/build-ota.sh birdcam   — только esp32_bird_cam (кормушка)
+#   ./scripts/build-ota.sh balcony birdcam
 
 set -euo pipefail
 
@@ -66,6 +67,7 @@ ota_filename() {
 PROJECTS=(
   "flat|esp32_flat_bme280|esp32:esp32:esp32:PartitionScheme=default|esp32.esp32.esp32|esp32-flat.bin|default"
   "balcony|esp32_balcony_pms5003_bme280|esp32:esp32:esp32:PartitionScheme=default|esp32.esp32.esp32|esp32-balcony.bin|default"
+  "birdcam|esp32_bird_cam|esp32:esp32:esp32cam:PartitionScheme=min_spiffs|esp32.esp32.esp32cam|esp32-bird-cam.bin|min_spiffs"
   "flamingo|esp32_flamingo|esp32:esp32:esp32:PartitionScheme=default|esp32.esp32.esp32|esp32-flamingo.bin|default"
   "default|esp32_default|esp32:esp32:esp32:PartitionScheme=default|esp32.esp32.esp32|esp32-default.bin|default"
 )
@@ -97,11 +99,14 @@ build_project() {
   fi
 
   echo "[$id] компиляция ($(read_fw_version "$sketch_dir"), $(date +%Y-%m-%d))..."
-  "$ARDUINO_CLI" compile \
+  if ! "$ARDUINO_CLI" compile \
     --fqbn "$fqbn" \
     --build-path "$build_path" \
     --build-property "compiler.cpp.extra_flags=-I$ROOT/include" \
-    "$sketch"
+    "$sketch"; then
+    echo "[$id] ошибка компиляции; OTA-бинарник и манифест не обновлены" >&2
+    return 1
+  fi
 
   local src_bin="$build_path/${ino_name}.bin"
   if [[ ! -f "$src_bin" ]]; then
@@ -144,7 +149,7 @@ main() {
   done
 
   if [[ $built -eq 0 ]]; then
-    echo "Ничего не собрано. Доступные цели: flat, balcony, flamingo, default" >&2
+    echo "Ничего не собрано. Доступные цели: flat, balcony, birdcam, flamingo, default" >&2
     exit 1
   fi
 

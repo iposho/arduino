@@ -11,6 +11,7 @@ flowchart LR
   subgraph devices [ESP32-устройства]
     B[esp32-balcony]
     F[esp32-flat]
+    C[esp32-bird-cam]
     FG[esp32-flamingo]
   end
 
@@ -24,6 +25,7 @@ flowchart LR
 
   B --> M
   F --> M
+  C --> M
   FG --> M
   F -->|relay sign| FG
   B --> S
@@ -196,7 +198,45 @@ ESP32 DevKit + BME280 + 1.8" TFT ST7735 + джойстик.
 
 ---
 
-### 3. esp32_flamingo — Неоновая вывеска «фламинго»
+### 3. esp32_bird_cam — Кормушка для птиц
+
+AI-Thinker ESP32-CAM (OV2640 или OV3660 — определяется сам) + microSD, смотрит на кормушку. Схема до сайта — `docs/birdfeeder.md` в `esp32-gateway-pi4`.
+
+- Аппаратный JPEG **SVGA** (800×600), quality 12; кадр держится в PSRAM
+- **Днём** кадр раз в секунду, **ночью** раз в 30 с. День/ночь — по средней яркости кадра (`DAYLIGHT_LUMA_*`)
+- **Детектор птиц без нейронки:** кадр декодируется в 1/8 (100×75), сравнивается с медленно подстраивающимся фоном; ≥2% изменившихся пикселей два кадра подряд — движение, резкая смена всей картинки (облако) — сброс фона. Пауза > 60 с — следующий визит считается новым
+- На SD (`/photos/NNNNN.jpg`, кольцо 4800) пишутся **только кадры с птицами** (не чаще раза в 10 с) и снимки по команде `capture`, с меткой времени. Журнал последних 24 снимков — в LittleFS, переживает перезагрузку
+- **MQTT** — телеметрия (`bird_last_at`, `bird_last`, `bird_visits_today`, `bird_photo_id`, `motion`, `daylight`, `luma`, `sensor`) и команды через шлюз
+- **HTTP** — статус-страница и раздача кадров:
+  - `http://esp32-bird-cam.local/` — статус, превью, яркость и движение (автообновление 10 с)
+  - `http://esp32-bird-cam.local/latest.jpg` — живой кадр из RAM (заголовки `X-Frame-Age-Ms`, `X-Daylight`)
+  - `http://esp32-bird-cam.local/photo?id=N` — снимок с SD по индексу (0–4799)
+  - `http://esp32-bird-cam.local/birds.json` — журнал снимков с птицами `{visits_today, last_at, shots:[{id, at}]}`
+
+**MQTT-команды:**
+
+| action | Описание |
+|--------|----------|
+| `capture` | Сохранить текущий кадр на SD |
+| `reboot` | Перезагрузка |
+| `led` + `value: bool` | Вспышка (GPIO 4); телеметрия сразу |
+| `ota` + `url: string` | OTA-обновление прошивки по HTTP(S) |
+
+**Пины (встроенные на плате):**
+
+| Компонент | GPIO |
+|-----------|------|
+| Камера OV2640 | 0, 5, 18–23, 25–27, 32, 34–39 |
+| microSD (1-bit) | CLK 14, CMD 15, D0 2 |
+| Вспышка | 4 |
+
+**Прошивка:** Board = **AI Thinker ESP32-CAM**, Partition = **Minimal SPIFFS (1.9MB APP with OTA/128KB SPIFFS)**. microSD — **FAT32**.
+
+> У ESP32-CAM в Arduino IDE по умолчанию стоит **Huge APP** — OTA там не работает. Прошивка камеры ~1.3 МБ, поэтому обычный Default (слот 1.2 МБ) тоже не подходит — нужен именно **min_spiffs**.
+
+---
+
+### 4. esp32_flamingo — Неоновая вывеска «фламинго»
 
 ESP32 DevKit + неоновая вывеска на GPIO 13 (PWM) + гирлянда на GPIO 33 + стробоскоп на GPIO 25 + кнопка на GPIO 27.
 
@@ -247,6 +287,7 @@ ESP32 DevKit + неоновая вывеска на GPIO 13 (PWM) + гирлян
 |--------|-------|------|----------|
 | esp32_balcony | ✓ | ✓ | ✓ |
 | esp32_flat | ✓ | ✓ | ✓ |
+| esp32_bird_cam | ✓ | ✓ | — |
 | esp32_flamingo | ✓ | ✓ | — |
 | esp32_default | ✓ | ✓ | — |
 
@@ -254,15 +295,17 @@ ESP32 DevKit + неоновая вывеска на GPIO 13 (PWM) + гирлян
 
 ### 2. Библиотеки (Arduino Library Manager)
 
-| Библиотека | Балкон | Комната | Flamingo | Default |
-|------------|:------:|:-------:|:--------:|:-------:|
-| Adafruit BME280 Library | ✓ | ✓ | | |
-| Adafruit GFX Library | ✓ | ✓ | | |
-| Adafruit SSD1306 | ✓ | | | |
-| Adafruit ST7735 and ST7789 Library | | ✓ | | |
-| PMS Library | ✓ | | | |
-| ArduinoJson | ✓ | ✓ | ✓ | ✓ |
-| PubSubClient | ✓ | ✓ | ✓ | ✓ |
+| Библиотека | Балкон | Комната | Камера | Flamingo | Default |
+|------------|:------:|:-------:|:------:|:--------:|:-------:|
+| Adafruit BME280 Library | ✓ | ✓ | | | |
+| Adafruit GFX Library | ✓ | ✓ | | | |
+| Adafruit SSD1306 | ✓ | | | | |
+| Adafruit ST7735 and ST7789 Library | | ✓ | | | |
+| PMS Library | ✓ | | | | |
+| ArduinoJson | ✓ | ✓ | ✓ | ✓ | ✓ |
+| PubSubClient | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+Камера использует встроенные `esp_camera` и `SD_MMC` (ESP32 Arduino core).
 
 ### 3. Прошивка
 
@@ -315,6 +358,7 @@ ESP32 DevKit + неоновая вывеска на GPIO 13 (PWM) + гирлян
 |------|-------|-----------|---------|--------------|
 | `flat` | ESP32 Dev Module | Default | 1.2.9 | `ota/esp32-flat-1.2.9-20260730.bin` |
 | `balcony` | ESP32 Dev Module | Default | 1.2.0 | `ota/esp32-balcony-1.2.0-20260730.bin` |
+| `birdcam` | AI Thinker ESP32-CAM | min_spiffs | 1.2.2 | `ota/esp32-bird-cam-1.2.2-20260926.bin` |
 | `flamingo` | ESP32 Dev Module | Default | 1.0.12 | `ota/esp32-flamingo-1.0.12-20260918.bin` |
 | `default` | ESP32 Dev Module | Default | 1.0.1 | `ota/esp32-default-1.0.1-20260706.bin` |
 
@@ -324,7 +368,7 @@ ESP32 DevKit + неоновая вывеска на GPIO 13 (PWM) + гирлян
 ./scripts/build-ota.sh              # все проекты
 ./scripts/build-ota.sh flat         # только комнатный дисплей
 ./scripts/build-ota.sh flamingo     # только вывеска
-./scripts/build-ota.sh balcony flat # балкон + комната
+./scripts/build-ota.sh balcony birdcam  # балкон + кормушка
 ```
 
 Требуется `secrets.h` в папке проекта. Для OTA нужен только файл приложения (`.ino.bin`), не полный образ flash.
@@ -363,6 +407,11 @@ arduino/
 │   └── secrets.example.h
 ├── esp32_flat_bme280/              # Комнатный дисплей
 │   ├── esp32_flat_bme280.ino
+│   ├── build/                      # (.gitignore)
+│   ├── secrets.h                   # (.gitignore)
+│   └── secrets.example.h
+├── esp32_bird_cam/                 # ESP32-CAM у кормушки, детектор птиц
+│   ├── esp32_bird_cam.ino
 │   ├── build/                      # (.gitignore)
 │   ├── secrets.h                   # (.gitignore)
 │   └── secrets.example.h

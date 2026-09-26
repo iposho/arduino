@@ -20,6 +20,7 @@
 | default | `esp32-default` | `esp32_default` | default | Универсальная заготовка для новой платы |
 | flat | `esp32-flat` | `esp32_flat_bme280` | default | Комнатный TFT + BME280/AHT/ENS160 |
 | balcony | `esp32-balcony` | `esp32_balcony_pms5003_bme280` | default | Балкон: BME280 + PMS5003 + OLED |
+| birdcam | `esp32-bird-cam` | `esp32_bird_cam` | **min_spiffs** | ESP32-CAM у кормушки: кадр 1 fps в RAM (`/latest.jpg`), детектор птиц, снимки птиц на SD (`/photo?id=`, `/birds.json`) |
 | flamingo | `esp32-flamingo` | `esp32_flamingo` | default | Вывеска PWM GPIO 13 + гирлянда GPIO 33 + стробоскоп GPIO 25 + кнопка GPIO 27 |
 
 ## MQTT
@@ -46,6 +47,7 @@
 
 - **По умолчанию выключен** (`boardLedOn = false`, `setBoardLed(false)` в `setup()`).
 - Active **LOW** на большинстве DevKit: `digitalWrite(LED_BUILTIN, on ? LOW : HIGH)`.
+- Исключение: **birdcam** — поле `led` в телеметрии = вспышка GPIO 4 (active HIGH).
 - Краткое мигание при загрузке только в `esp32_default` (`blinkBootLed()`).
 
 ### Команда `status` — разная семантика
@@ -54,7 +56,7 @@
 |-------|----------------------|
 | default | Немедленно публикует телеметрию |
 | flat, balcony | Показывает системный экран на дисплее |
-| flamingo | Команды нет в capabilities |
+| flamingo, birdcam | Команды нет в capabilities |
 
 ## Изменение прошивки
 
@@ -72,7 +74,7 @@
 
 ## Выведенные из эксплуатации
 
-`esp32_cam` удалён из репозитория (2026-09). Плата ESP32-CAM теперь работает как `esp32-bird-cam` (кормушка) — её прошивка **не** в этом репозитории; не прошивать её скетчами отсюда. Ранее удалены `esp32_lamp`, `esp32_cam_stream`, `esp32_growbox`, `esp32_bedroom`. В шлюзе их `device_id` лежат в `deleted_devices` — так и должно быть.
+`esp32_cam` удалён из репозитория (2026-09). Плата ESP32-CAM теперь работает как `esp32-bird-cam` (кормушка); актуальная прошивка — `esp32_bird_cam` в этом репозитории, цель сборки — `birdcam`, partition — **min_spiffs**. Старый `esp32_cam` не восстанавливать. Ранее удалены `esp32_lamp`, `esp32_cam_stream`, `esp32_growbox`, `esp32_bedroom`; их `device_id` в шлюзе остаются в `deleted_devices`.
 
 ## Типичные ошибки (не повторять)
 
@@ -80,3 +82,6 @@
 - Забыть `publishMqttTelemetry()` в `ensureMqtt()` после connect.
 - Считать, что `led` включён по умолчанию — в коде всегда `false`; «включён» в UI = устаревшая телеметрия.
 - Путать GPIO 33: кнопка на flat (вывеска), гирлянда на flamingo.
+- Для birdcam использовать partition Huge APP или Default — нужен **min_spiffs**.
+- birdcam: сначала аппаратный JPEG SVGA; если 5 кадров подряд не пришло (у OV3660 на AI-Thinker — `cam_hal: FB-OVF`), прошивка сама переходит на RGB565 VGA + программный JPEG (`cam_mode` в телеметрии). Детектор работает на кадре 1/8 (≤100×75, `MOTION_MAX_*`).
+- birdcam: `capture` сохраняет текущий кадр на SD; периодической съёмки на SD больше нет — только визиты птиц (не чаще раза в 10 с).
