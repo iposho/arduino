@@ -8,6 +8,9 @@
 #include <LittleFS.h>
 #include <time.h>
 #include <esp_ota_ops.h>
+#include <esp_timer.h>
+#include <esp_system.h>
+#include <esp_core_dump.h>
 
 #include "esp_camera.h"
 #include "img_converters.h"
@@ -58,14 +61,19 @@ const unsigned long WIFI_RETRY_INTERVAL     = 30UL * 1000UL;
 const unsigned long NTP_GMT_OFFSET_SEC      = 4UL * 3600UL;
 // Шкалы качества разные: у аппаратного JPEG сенсора 0..63 и меньше — лучше,
 // у программного кодировщика (frame2jpg / fmt2jpg) 1..100 и больше — лучше.
-const uint8_t JPEG_STREAM_QUALITY           = 12;  // аппаратный JPEG сенсора, SVGA ≈ 30–50 КБ
+// JPEG_STREAM_QUALITY — источник всего: и /latest.jpg, и снимков на SD.
+// 8 вместо 12: перекодирование (метка времени) съедает часть деталей,
+// более чистый источник заметно меньше «квадратится» на выходе.
+const uint8_t JPEG_STREAM_QUALITY           = 8;   // аппаратный JPEG сенсора, SVGA ≈ 45–75 КБ
 const uint8_t JPEG_SOFT_QUALITY             = 80;  // программный JPEG: живой кадр в режиме RGB565, VGA ≈ 40–60 КБ
-const uint8_t JPEG_SAVE_QUALITY             = 85;  // программный JPEG: снимок с меткой времени для SD
+const uint8_t JPEG_SAVE_QUALITY             = 90;  // программный JPEG: снимок с меткой времени для SD
 
 // =====================
-// Детектор птиц (без нейронки): разница кадра 1/8 (100×75) с медленным фоном
+// Детектор движения: разница кадра 1/8 (100×75) с медленным фоном.
+// Птица ли это и какая — решает шлюз по снимку на SD (нейронка через AI Gateway).
 // =====================
-// Сетка детектора = кадр / 8: SVGA → 100×75, VGA (режим RGB565) → 80×60
+// Сетка детектора = кадр / 8: SVGA → 100×75, VGA (режим RGB565) → 80×60.
+// jpg2rgb565(JPG_SCALE_8X) пишет весь кадр / 8, буфер должен вмещать его целиком.
 const uint16_t MOTION_MAX_W = 100;
 const uint16_t MOTION_MAX_H = 75;
 // Аппаратный JPEG не дал кадра столько раз подряд — переходим на RGB565
@@ -98,6 +106,13 @@ const char* PHOTO_INDEX_FILE = "/photo_index.dat";
 const char* BIRD_LOG_FILE = "/bird_log.dat";
 const uint8_t BIRD_LOG_SIZE = 24;  // последние снимки с птицами (id на SD + время)
 
+// sdFreeBytes() кэшируется: SD_MMC.usedBytes() сканирует FAT и блокируется
+// на секунды — в телеметрии каждые 10 с это дёргало детектор
+const unsigned long SD_FREE_TTL_MS = 60UL * 1000UL;
+// Запас для новых файлов; меньше — вытесняем самые старые снимки,
+// иначе на карте меньшей, чем 4800 фото, запись встаёт намертво
+const uint64_t SD_FREE_MIN_BYTES = 4ULL * 1024 * 1024;
+
 // =====================
 // State
 // =====================
@@ -126,6 +141,67 @@ const char *CAPABILITIES = R"CAP({
       "type": "trigger",
       "icon": "camera",
       "description": "Сохранить текущий кадр на SD"
+    },
+    {
+      "action": "cam_ae",
+      "title": "Экспозиция",
+      "type": "range",
+      "icon": "sun",
+      "min": -2,
+      "max": 2,
+      "description": "Меньше — темнее, без розовых пересветов"
+    },
+    {
+      "action": "cam_saturation",
+      "title": "Насыщенность",
+      "type": "range",
+      "icon": "circle",
+      "min": -2,
+      "max": 2,
+      "description": "Цветность кадра"
+    },
+    {
+      "action": "cam_wb",
+      "title": "Баланс белого",
+      "type": "range",
+      "icon": "thermometer",
+      "min": 0,
+      "max": 4,
+      "description": "0 авто, 1 солнце, 2 облачно, 3 офис, 4 дом"
+    },
+    {
+      "action": "cam_brightness",
+      "title": "Яркость",
+      "type": "range",
+      "icon": "sun",
+      "min": -2,
+      "max": 2,
+      "description": "Яркость кадра сенсора"
+    },
+    {
+      "action": "cam_contrast",
+      "title": "Контраст",
+      "type": "range",
+      "icon": "circle",
+      "min": -2,
+      "max": 2,
+      "description": "Контраст кадра сенсора"
+    },
+    {
+      "action": "cam_quality",
+      "title": "Качество JPEG",
+      "type": "range",
+      "icon": "image",
+      "min": 4,
+      "max": 20,
+      "description": "Аппаратное качество источника (0..63, меньше — чётче и тяжелее)"
+    },
+    {
+      "action": "cam_reset",
+      "title": "Цвет по умолчанию",
+      "type": "trigger",
+      "icon": "refresh-cw",
+      "description": "Сбросить экспозицию, насыщенность, баланс белого"
     },
     {
       "action": "reboot",
@@ -177,6 +253,8 @@ uint8_t* frameBuf = nullptr;
 size_t frameLen = 0;
 size_t frameCap = 0;
 unsigned long frameAtMs = 0;
+/** frameAtMs кадра, уже записанного на SD: capture не пишет его второй раз */
+unsigned long savedFrameAtMs = 0;
 uint32_t frameErrors = 0;
 
 // Детектор
@@ -187,6 +265,31 @@ uint16_t motionH = MOTION_MAX_H;
 // сыплет cam_hal: FB-OVF и не отдаёт ни одного кадра — тогда RGB565 VGA
 // с программным JPEG (так камера работала в прошивках ≤1.1.8).
 bool camRgbMode = false;
+// Флаг в LittleFS: у этого сенсора JPEG не работает. Удалить — fs_rm /cam_rgb.flag
+const char* CAM_RGB_FLAG_FILE = "/cam_rgb.flag";
+
+// Причина последней перезагрузки и выжимка coredump (если было падение) —
+// уходят в телеметрию: без USB иначе не узнать, почему камера перезагружается.
+// Адреса bt раскладываются по исходникам через addr2line и .elf этой сборки.
+char bootReason[16] = "";
+char crashInfo[200] = "";
+
+// Цвет кадра: подбирается командами cam_* с дашборда и хранится в LittleFS.
+// У OV3660 яркость +1 (как в CameraWebServer) выжигала белое в розовое:
+// по умолчанию вместо неё экспозиция −1.
+const char* CAM_TUNING_FILE = "/cam_tuning.dat";
+const uint8_t CAM_TUNING_MAGIC = 0xC8;     // ae, saturation, wb, brightness, contrast, quality
+const uint8_t CAM_TUNING_MAGIC_V1 = 0xC7;  // старый формат 1.3.x: ae, saturation, wb
+struct CamTuning {
+  int8_t ae;          // set_ae_level, -2..2
+  int8_t saturation;  // set_saturation, -2..2
+  uint8_t wb;         // set_wb_mode: 0 авто, 1 солнце, 2 облачно, 3 офис, 4 дом
+  int8_t brightness;  // set_brightness, -2..2
+  int8_t contrast;    // set_contrast, -2..2
+  uint8_t quality;    // set_quality (аппаратный JPEG), 0..63 меньше — лучше
+};
+CamTuning camTuning = { 0, 0, 0, 0, 0, JPEG_STREAM_QUALITY };
+bool camTuningSaved = false;
 uint8_t camFailStreak = 0;
 uint8_t* motionGray = nullptr;  // текущий кадр
 uint8_t* motionBg = nullptr;    // фон
@@ -201,7 +304,9 @@ unsigned long lastMotionMs = 0;
 unsigned long lastBirdSaveMs = 0;
 time_t birdLastAt = 0;
 uint16_t birdVisitsToday = 0;
-int birdVisitsYday = -1;
+// День счётчика: год * 1000 + день года; -1 — неизвестен (нет времени и файла)
+int32_t birdVisitsDay = -1;
+const char* BIRD_VISITS_FILE = "/bird_visits.dat";
 
 struct BirdShot {
   uint16_t photoId;
@@ -214,6 +319,8 @@ uint8_t birdLogHead = 0;   // куда писать следующую
 unsigned long lastFrameTime = 0;
 unsigned long lastMqttTelemetry = 0;
 unsigned long lastWifiRetry = 0;
+unsigned long lastNtpAttempt = 0;
+const unsigned long NTP_RETRY_INTERVAL = 60UL * 1000UL;
 
 char otaUrl[256] = "";
 bool otaPending = false;
@@ -227,6 +334,12 @@ int otaProgressPct = -1;
 size_t otaBytesDone = 0;
 size_t otaBytesTotal = 0;
 unsigned long otaStartedMs = 0;
+// Сторож OTA: Updater при оборванном TCP ждёт 300 × таймаут HTTP (8 с) ≈ 40 мин,
+// снаружи это выглядит как зависание. Нет новых байт дольше OTA_STALL_MS — ребут,
+// старая прошивка остаётся в своём слоте.
+const unsigned long OTA_STALL_MS = 60UL * 1000UL;
+volatile unsigned long otaLastDataMs = 0;
+esp_timer_handle_t otaWatchdog = nullptr;
 
 // =====================
 // Forward declarations
@@ -248,7 +361,7 @@ void pushBirdShot(uint16_t photoId, uint32_t at);
 void handleBirdsJson();
 bool encodePhotoJpeg(uint8_t** outBuf, size_t* outLen, bool* outAllocated);
 void formatCaptureTimestamp(char* buf, size_t len);
-void connectWiFi();
+void connectWiFi(bool wait = true);
 void syncTime();
 void initMqttTopics();
 void ensureMqtt();
@@ -338,18 +451,21 @@ static const uint8_t kTsFont[][5] PROGMEM = {
   {0x00, 0x36, 0x36, 0x00, 0x00},
 };
 
-static void setPixel565(uint8_t* rgb, int width, int height, int x, int y, uint16_t color) {
+// RGB888 (3 байта/пиксель): без квантования в 65K цветов RGB565,
+// из-за которого на градиентах (небо) появлялась полосатость
+static void setPixel24(uint8_t* rgb, int width, int height, int x, int y, uint32_t color) {
   if (x < 0 || y < 0 || x >= width || y >= height) return;
-  size_t idx = ((size_t)y * (size_t)width + (size_t)x) * 2;
-  rgb[idx] = color & 0xFF;
+  size_t idx = ((size_t)y * (size_t)width + (size_t)x) * 3;
+  rgb[idx] = color >> 16;
   rgb[idx + 1] = color >> 8;
+  rgb[idx + 2] = color;
 }
 
-static void fillRect565(uint8_t* rgb, int width, int height,
-                        int x, int y, int w, int h, uint16_t color) {
+static void fillRect24(uint8_t* rgb, int width, int height,
+                       int x, int y, int w, int h, uint32_t color) {
   for (int row = y; row < y + h; row++) {
     for (int col = x; col < x + w; col++) {
-      setPixel565(rgb, width, height, col, row, color);
+      setPixel24(rgb, width, height, col, row, color);
     }
   }
 }
@@ -360,8 +476,8 @@ static const uint8_t* tsGlyphForChar(char c) {
   return kTsFont[hit - kTsFontChars];
 }
 
-static void drawTsChar565(uint8_t* rgb, int width, int height,
-                          int x, int y, char c, uint16_t fg, int scale) {
+static void drawTsChar24(uint8_t* rgb, int width, int height,
+                         int x, int y, char c, uint32_t fg, int scale) {
   const uint8_t* glyph = tsGlyphForChar(c);
   for (int col = 0; col < 5; col++) {
     uint8_t bits = pgm_read_byte(&glyph[col]);
@@ -369,14 +485,14 @@ static void drawTsChar565(uint8_t* rgb, int width, int height,
       if (!(bits & (1 << row))) continue;
       for (int sy = 0; sy < scale; sy++) {
         for (int sx = 0; sx < scale; sx++) {
-          setPixel565(rgb, width, height, x + col * scale + sx, y + row * scale + sy, fg);
+          setPixel24(rgb, width, height, x + col * scale + sx, y + row * scale + sy, fg);
         }
       }
     }
   }
 }
 
-static void drawTimestamp565(uint8_t* rgb, int width, int height, const char* text) {
+static void drawTimestamp888(uint8_t* rgb, int width, int height, const char* text) {
   const int scale = 2;
   const int margin = 10;
   const int charStep = 6 * scale;
@@ -385,16 +501,17 @@ static void drawTimestamp565(uint8_t* rgb, int width, int height, const char* te
   const int x = margin;
   const int y = height - textH - margin;
 
-  fillRect565(rgb, width, height, x - 3, y - 3, textW, textH, 0x0000);
+  fillRect24(rgb, width, height, x - 3, y - 3, textW, textH, 0x000000);
 
   int cx = x;
   for (const char* p = text; *p; p++) {
-    drawTsChar565(rgb, width, height, cx, y, *p, 0xFFFF, scale);
+    drawTsChar24(rgb, width, height, cx, y, *p, 0xFFFFFF, scale);
     cx += charStep;
   }
 }
 
-// Снимок для SD: JPEG кадра → RGB565 → метка времени → JPEG.
+// Снимок для SD: JPEG кадра → RGB888 → метка времени → JPEG.
+// RGB888 вместо RGB565: без перестановки байт и без потерь 565 (полосатость).
 // Если метку поставить нельзя (нет времени/памяти) — пишем исходный JPEG как есть.
 bool encodePhotoJpeg(uint8_t** outBuf, size_t* outLen, bool* outAllocated) {
   if (!frameBuf || frameLen == 0 || !outBuf || !outLen || !outAllocated) return false;
@@ -409,28 +526,24 @@ bool encodePhotoJpeg(uint8_t** outBuf, size_t* outLen, bool* outAllocated) {
     return true;
   }
 
-  const uint16_t w = resolution[s->status.framesize].width;
-  const uint16_t h = resolution[s->status.framesize].height;
-  size_t rgbLen = (size_t)w * h * 2;
+  // Размер — из самого JPEG: буфер под декодер должен вмещать именно этот кадр
+  uint16_t w = 0, h = 0;
+  if (!jpegSize(frameBuf, frameLen, &w, &h)) {
+    *outBuf = frameBuf;
+    *outLen = frameLen;
+    return true;
+  }
+  size_t rgbLen = (size_t)w * h * 3;
   uint8_t* rgb = (uint8_t*)ps_malloc(rgbLen);
-  if (!rgb || !jpg2rgb565(frameBuf, frameLen, rgb, JPG_SCALE_NONE)) {
+  if (!rgb || !fmt2rgb888(frameBuf, frameLen, PIXFORMAT_JPEG, rgb)) {
     if (rgb) free(rgb);
     *outBuf = frameBuf;
     *outLen = frameLen;
     return true;
   }
 
-  // jpg2rgb565 отдаёт RGB565 в обратном порядке байт относительно того, что ждёт
-  // fmt2jpg (порядок сенсора). Без перестановки снимок на SD выходит «кислотным»:
-  // младшие биты зелёного попадают в старшие разряды — радужные полосы вместо градиентов.
-  for (size_t i = 0; i + 1 < rgbLen; i += 2) {
-    uint8_t t = rgb[i];
-    rgb[i] = rgb[i + 1];
-    rgb[i + 1] = t;
-  }
-
-  drawTimestamp565(rgb, w, h, ts);
-  bool ok = fmt2jpg(rgb, rgbLen, w, h, PIXFORMAT_RGB565, JPEG_SAVE_QUALITY, outBuf, outLen);
+  drawTimestamp888(rgb, w, h, ts);
+  bool ok = fmt2jpg(rgb, rgbLen, w, h, PIXFORMAT_RGB888, JPEG_SAVE_QUALITY, outBuf, outLen);
   free(rgb);
   if (!ok) {
     *outBuf = frameBuf;
@@ -447,14 +560,163 @@ String photoPathForIndex(uint16_t index) {
   return String(path);
 }
 
+static uint64_t sdFreeCache = 0;
+static unsigned long sdFreeCacheMs = 0;
+static bool sdFreeCacheValid = false;
+// Самый старый ещё не вытесненный индекс (только до заполнения кольца)
+static uint16_t sdEvictedUpTo = 0;
+
+static void refreshSdFreeCache() {
+  sdFreeCache = sdReady ? (SD_MMC.totalBytes() - SD_MMC.usedBytes()) : 0;
+  sdFreeCacheValid = true;
+  sdFreeCacheMs = millis();
+}
+
+// Кэш на SD_FREE_TTL_MS: usedBytes() сканирует FAT и блокируется на секунды,
+// прямой вызов в телеметрии каждые 10 с (и на каждый всплеск визитов)
+// останавливал детектор. Во время OTA обновление кэша не проводим —
+// сканирование FAT рвёт загрузку (см. publishOtaEvent).
 uint64_t sdFreeBytes() {
   if (!sdReady) return 0;
-  return SD_MMC.totalBytes() - SD_MMC.usedBytes();
+  if (!sdFreeCacheValid) {
+    refreshSdFreeCache();
+  } else if (millis() - sdFreeCacheMs >= SD_FREE_TTL_MS && !otaInProgress) {
+    refreshSdFreeCache();
+  }
+  return sdFreeCache;
 }
 
 // =====================
 // Camera
 // =====================
+
+CamTuning defaultCamTuning(uint16_t pid) {
+  // OV3660 по умолчанию пересвечен и перенасыщен
+  if (pid == OV3660_PID) return { -1, -2, 0, 0, 0, JPEG_STREAM_QUALITY };
+  return { 0, 0, 0, 0, 0, JPEG_STREAM_QUALITY };
+}
+
+void loadCamTuning(uint16_t pid) {
+  camTuning = defaultCamTuning(pid);
+  camTuningSaved = false;
+  if (!littleFsReady || !LittleFS.exists(CAM_TUNING_FILE)) return;
+  File f = LittleFS.open(CAM_TUNING_FILE, "r");
+  if (!f) return;
+  uint8_t buf[7];
+  size_t n = f.read(buf, sizeof(buf));
+  f.close();
+
+  if (n >= 4 && buf[0] == CAM_TUNING_MAGIC_V1) {
+    // Файл прошлой версии: яркость/контраст/качество остаются умолчаниями
+    camTuning.ae = constrain((int8_t)buf[1], -2, 2);
+    camTuning.saturation = constrain((int8_t)buf[2], -2, 2);
+    camTuning.wb = min<uint8_t>(buf[3], 4);
+    camTuningSaved = true;
+  } else if (n == sizeof(buf) && buf[0] == CAM_TUNING_MAGIC) {
+    camTuning.ae = constrain((int8_t)buf[1], -2, 2);
+    camTuning.saturation = constrain((int8_t)buf[2], -2, 2);
+    camTuning.wb = min<uint8_t>(buf[3], 4);
+    camTuning.brightness = constrain((int8_t)buf[4], -2, 2);
+    camTuning.contrast = constrain((int8_t)buf[5], -2, 2);
+    camTuning.quality = min<uint8_t>(buf[6], 63);
+    camTuningSaved = true;
+  }
+}
+
+void saveCamTuning() {
+  if (!littleFsReady) return;
+  File f = LittleFS.open(CAM_TUNING_FILE, "w");
+  if (!f) return;
+  uint8_t buf[7] = { CAM_TUNING_MAGIC, (uint8_t)camTuning.ae, (uint8_t)camTuning.saturation,
+                     camTuning.wb, (uint8_t)camTuning.brightness, (uint8_t)camTuning.contrast,
+                     camTuning.quality };
+  f.write(buf, sizeof(buf));
+  f.close();
+  camTuningSaved = true;
+}
+
+void applyCamTuning(sensor_t* s) {
+  if (!s) return;
+  s->set_ae_level(s, camTuning.ae);
+  s->set_saturation(s, camTuning.saturation);
+  s->set_brightness(s, camTuning.brightness);
+  s->set_contrast(s, camTuning.contrast);
+  s->set_quality(s, camTuning.quality);
+  s->set_whitebal(s, 1);
+  s->set_awb_gain(s, 1);
+  s->set_wb_mode(s, camTuning.wb);
+  Serial.printf("[Camera] tuning ae=%d saturation=%d wb=%u brightness=%d contrast=%d quality=%u%s\n",
+                camTuning.ae, camTuning.saturation, camTuning.wb, camTuning.brightness,
+                camTuning.contrast, camTuning.quality, camTuningSaved ? " (saved)" : " (default)");
+}
+
+// Команды cam_*: применить сразу, сохранить, сбросить фон детектора
+// (смена экспозиции иначе выглядит как движение по всему кадру)
+void setCamTuning(const char* action, int value) {
+  if (strcmp(action, "cam_ae") == 0) camTuning.ae = constrain(value, -2, 2);
+  else if (strcmp(action, "cam_saturation") == 0) camTuning.saturation = constrain(value, -2, 2);
+  else if (strcmp(action, "cam_wb") == 0) camTuning.wb = constrain(value, 0, 4);
+  else if (strcmp(action, "cam_brightness") == 0) camTuning.brightness = constrain(value, -2, 2);
+  else if (strcmp(action, "cam_contrast") == 0) camTuning.contrast = constrain(value, -2, 2);
+  else if (strcmp(action, "cam_quality") == 0) camTuning.quality = constrain(value, 0, 63);
+  saveCamTuning();
+  applyCamTuning(esp_camera_sensor_get());
+  motionBgReady = false;
+}
+
+void resetCamTuning() {
+  if (littleFsReady) LittleFS.remove(CAM_TUNING_FILE);
+  sensor_t* s = esp_camera_sensor_get();
+  loadCamTuning(s ? s->id.PID : 0);
+  applyCamTuning(s);
+  motionBgReady = false;
+}
+
+
+const char* resetReasonName(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:   return "power_on";
+    case ESP_RST_EXT:       return "external";
+    case ESP_RST_SW:        return "software";
+    case ESP_RST_PANIC:     return "panic";
+    case ESP_RST_INT_WDT:   return "int_wdt";
+    case ESP_RST_TASK_WDT:  return "task_wdt";
+    case ESP_RST_WDT:       return "wdt";
+    case ESP_RST_DEEPSLEEP: return "deep_sleep";
+    case ESP_RST_BROWNOUT:  return "brownout";
+    case ESP_RST_SDIO:      return "sdio";
+    default:                return "unknown";
+  }
+}
+
+void readBootDiagnostics() {
+  esp_reset_reason_t reason = esp_reset_reason();
+  strlcpy(bootReason, resetReasonName(reason), sizeof(bootReason));
+  Serial.printf("[Boot] reset reason: %s\n", bootReason);
+
+  // Дамп в flash остаётся от прошлого падения: читаем его, только если
+  // эта перезагрузка и есть падение, иначе он устаревший
+  if (reason != ESP_RST_PANIC && reason != ESP_RST_INT_WDT &&
+      reason != ESP_RST_TASK_WDT && reason != ESP_RST_WDT) return;
+
+  esp_core_dump_summary_t* sum = (esp_core_dump_summary_t*)malloc(sizeof(esp_core_dump_summary_t));
+  if (!sum) return;
+  if (esp_core_dump_get_summary(sum) == ESP_OK) {
+    int n = snprintf(crashInfo, sizeof(crashInfo), "%.15s pc=0x%08lx cause=%lu bt=",
+                     sum->exc_task, (unsigned long)sum->exc_pc,
+                     (unsigned long)sum->ex_info.exc_cause);
+    for (uint32_t i = 0; i < sum->exc_bt_info.depth && i < 10; i++) {
+      if (n < 0 || n >= (int)sizeof(crashInfo) - 12) break;
+      n += snprintf(crashInfo + n, sizeof(crashInfo) - n, "%s0x%08lx", i ? "," : "",
+                    (unsigned long)sum->exc_bt_info.bt[i]);
+    }
+    Serial.printf("[Boot] crash: %s\n", crashInfo);
+  } else {
+    Serial.println("[Boot] crash: no coredump summary");
+  }
+  free(sum);
+}
+
 bool initCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -485,7 +747,8 @@ bool initCamera() {
     config.fb_count = 1;
   } else {
     // Буферы драйвер выделяет под frame_size при init (JPEG ≈ w*h/5): init на UXGA
-    // даёт запас, рабочее разрешение — SVGA ниже.
+    // даёт запас, рабочее разрешение — SVGA ниже. XGA на OV3660 (AI-Thinker) не
+    // выдаёт кадров (FB-OVF) и уходит в RGB565 VGA — проверено на 1.3.1.
     config.frame_size = FRAMESIZE_UXGA;
     config.pixel_format = PIXFORMAT_JPEG;
     config.fb_count = 2;
@@ -533,15 +796,10 @@ bool initCamera() {
     if (!camRgbMode) s->set_framesize(s, FRAMESIZE_SVGA);
     s->set_hmirror(s, 0);
     s->set_vflip(s, 1);
-    if (s->id.PID == OV3660_PID) {
-      // Как в CameraWebServer от Espressif: OV3660 по умолчанию тёмный и пересвеченный по цвету
-      s->set_brightness(s, 1);
-      s->set_saturation(s, -2);
-    } else {
-      s->set_brightness(s, 0);
-      s->set_contrast(s, 0);
-      s->set_saturation(s, 0);
-    }
+    s->set_brightness(s, 0);
+    s->set_contrast(s, 0);
+    loadCamTuning(s->id.PID);
+    applyCamTuning(s);
   }
 
   framesize_t fs = s ? (framesize_t)s->status.framesize : (camRgbMode ? FRAMESIZE_VGA : FRAMESIZE_SVGA);
@@ -561,6 +819,10 @@ void switchToRgbMode() {
   esp_camera_deinit();
   cameraReady = false;
   camRgbMode = true;
+  if (littleFsReady) {
+    File f = LittleFS.open(CAM_RGB_FLAG_FILE, "w");
+    if (f) f.close();
+  }
   initCamera();
   publishMqttTelemetry();
 }
@@ -597,6 +859,7 @@ bool initSdCard() {
   }
 
   sdReady = true;
+  sdFreeCacheValid = false;  // после (пере)монтирования кэш свободного места устарел
   Serial.printf("[SD] OK, free %llu MB\n", sdFreeBytes() / (1024ULL * 1024ULL));
   restorePhotoIndex();
   return true;
@@ -680,6 +943,35 @@ void restorePhotoIndex() {
   Serial.printf("[SD] photo index restored to %u\n", photoIndex);
 }
 
+// Место под файл photoIndex. Перезапись кольца (файл уже существует) нового
+// места не требует — кластеры освободит сама запись. Новый файл на карте
+// меньшей, чем 4800 фото, иначе встал бы намертво с момента заполнения:
+// вытесняем самые старые снимки, пока не наберётся SD_FREE_MIN_BYTES.
+// false — места нет и вытеснять нечего.
+static bool ensureSdRoom(const String& path) {
+  if (SD_MMC.exists(path)) return true;
+  if (sdFreeBytes() >= SD_FREE_MIN_BYTES) return true;
+
+  Serial.println("[SD] low on space — evicting oldest photos");
+  for (uint16_t i = sdEvictedUpTo; i < photoIndex; i++) {
+    String old = photoPathForIndex(i);
+    if (!SD_MMC.exists(old)) continue;
+    File f = SD_MMC.open(old, FILE_READ);
+    uint64_t sz = f ? (uint64_t)f.size() : 0;
+    if (f) f.close();
+    if (!SD_MMC.remove(old)) {
+      Serial.printf("[SD] evict %s failed\n", old.c_str());
+      continue;
+    }
+    sdEvictedUpTo = i + 1;
+    if (sdFreeCacheValid) sdFreeCache += sz;
+    sdFreeCacheMs = millis();
+    Serial.printf("[SD] evicted %s (%llu B)\n", old.c_str(), (unsigned long long)sz);
+    if (sdFreeBytes() >= SD_FREE_MIN_BYTES) return true;
+  }
+  return sdFreeBytes() >= SD_FREE_MIN_BYTES;
+}
+
 bool captureAndSavePhoto() {
   if (!cameraReady || !sdReady || !frameBuf || frameLen == 0) {
     lastCaptureOk = false;
@@ -688,6 +980,14 @@ bool captureAndSavePhoto() {
   }
 
   String path = photoPathForIndex(photoIndex);
+  if (!ensureSdRoom(path)) {
+    Serial.println("[Capture] SD full — no photos to evict");
+    lastCaptureOk = false;
+    captureErrors++;
+    setStatus("SD full");
+    return false;
+  }
+  bool newFile = !SD_MMC.exists(path);
   File file = SD_MMC.open(path, FILE_WRITE);
   if (!file) {
     Serial.printf("[Capture] open %s failed\n", path.c_str());
@@ -720,6 +1020,8 @@ bool captureAndSavePhoto() {
 
   strncpy(lastPhotoPath, path.c_str(), sizeof(lastPhotoPath) - 1);
   lastPhotoPath[sizeof(lastPhotoPath) - 1] = '\0';
+  savedFrameAtMs = frameAtMs;
+  if (newFile && sdFreeCacheValid && sdFreeCache >= written) sdFreeCache -= written;
 
   photoIndex = (photoIndex + 1) % MAX_PHOTOS;
   captureCount++;
@@ -734,6 +1036,27 @@ bool captureAndSavePhoto() {
 // =====================
 // Кадр + детектор птиц
 // =====================
+// Ширина и высота из маркера SOF JPEG. jpg2rgb565 не знает размера выходного буфера:
+// кадр крупнее ожидаемого (переходный после set_framesize/initCamera) испортил бы PSRAM.
+static bool jpegSize(const uint8_t* buf, size_t len, uint16_t* w, uint16_t* h) {
+  if (len < 4 || buf[0] != 0xFF || buf[1] != 0xD8) return false;
+  size_t i = 2;
+  while (i + 9 < len) {
+    if (buf[i] != 0xFF) return false;
+    uint8_t m = buf[i + 1];
+    if (m == 0xFF) { i++; continue; }  // заполнитель
+    if (m >= 0xC0 && m <= 0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC) {
+      *h = ((uint16_t)buf[i + 5] << 8) | buf[i + 6];
+      *w = ((uint16_t)buf[i + 7] << 8) | buf[i + 8];
+      return *w > 0 && *h > 0;
+    }
+    size_t seg = ((size_t)buf[i + 2] << 8) | buf[i + 3];
+    if (seg < 2) return false;
+    i += 2 + seg;
+  }
+  return false;
+}
+
 static bool storeFrame(const uint8_t* jpg, size_t len) {
   if (len > frameCap) {
     size_t cap = len + 16 * 1024;
@@ -801,9 +1124,14 @@ static uint16_t countChangedPermille(const uint8_t* cur, const uint8_t* bg, uint
 // Фон подтягивается к текущему кадру: быстро в покое, медленно при движении
 // (сидящая долго птица постепенно «впитывается», и визит заканчивается).
 static void blendBackground(uint8_t* bg, const uint8_t* cur, size_t n, uint8_t shift) {
+  // Шаг округляется, а не отбрасывается: при d / 32 разница 29–31 не впитывалась
+  // никогда, была выше MOTION_PIXEL_DIFF, и «движение» с визитом не кончались.
+  // С округлением остаток ≤ 2^(shift-1) = 16 < MOTION_PIXEL_DIFF.
+  const int half = 1 << (shift - 1);
   for (size_t i = 0; i < n; i++) {
     int d = (int)cur[i] - (int)bg[i];
-    bg[i] = (uint8_t)((int)bg[i] + d / (1 << shift));
+    int step = (d + (d >= 0 ? half : -half)) / (1 << shift);
+    bg[i] = (uint8_t)((int)bg[i] + step);
   }
 }
 
@@ -845,19 +1173,46 @@ int latestBirdPhotoId() {
   return birdLog[(birdLogHead + BIRD_LOG_SIZE - 1) % BIRD_LOG_SIZE].photoId;
 }
 
+void saveBirdVisits() {
+  if (!littleFsReady) return;
+  File f = LittleFS.open(BIRD_VISITS_FILE, "w");
+  if (!f) return;
+  f.write((const uint8_t*)&birdVisitsDay, sizeof(birdVisitsDay));
+  f.write((const uint8_t*)&birdVisitsToday, sizeof(birdVisitsToday));
+  f.close();
+}
+
+void loadBirdVisits() {
+  if (!littleFsReady || !LittleFS.exists(BIRD_VISITS_FILE)) return;
+  File f = LittleFS.open(BIRD_VISITS_FILE, "r");
+  if (!f) return;
+  int32_t day;
+  uint16_t count;
+  if (f.read((uint8_t*)&day, sizeof(day)) == sizeof(day) &&
+      f.read((uint8_t*)&count, sizeof(count)) == sizeof(count)) {
+    birdVisitsDay = day;
+    birdVisitsToday = count;
+  }
+  f.close();
+}
+
 void resetBirdCounterIfNewDay() {
   time_t now = time(nullptr);
   if (now < 100000) return;
   struct tm* t = localtime(&now);
-  if (t->tm_yday != birdVisitsYday) {
-    birdVisitsYday = t->tm_yday;
-    birdVisitsToday = 0;
-  }
+  int32_t day = (int32_t)(t->tm_year + 1900) * 1000 + t->tm_yday;
+  if (day == birdVisitsDay) return;
+  // День неизвестен (время появилось впервые) — визиты до синхронизации
+  // считаем сегодняшними, а не обнуляем
+  if (birdVisitsDay != -1) birdVisitsToday = 0;
+  birdVisitsDay = day;
+  saveBirdVisits();
 }
 
 void onBirdVisitStart() {
   resetBirdCounterIfNewDay();
   birdVisitsToday++;
+  saveBirdVisits();
   Serial.printf("[Bird] visit #%u (changed %u‰)\n", birdVisitsToday, motionPermille);
   setStatus("Bird!");
 }
@@ -874,12 +1229,18 @@ void analyzeFrame(unsigned long now) {
       return;
     }
   }
+  uint16_t jw = 0, jh = 0;
+  if (!jpegSize(frameBuf, frameLen, &jw, &jh) || (jw + 7) / 8 != motionW || (jh + 7) / 8 != motionH) {
+    // Кадр не того размера: декодер записал бы больше, чем вмещает motionRgb
+    frameErrors++;
+    return;
+  }
   if (!jpg2rgb565(frameBuf, frameLen, motionRgb, JPG_SCALE_8X)) {
     frameErrors++;
     return;
   }
 
-  // jpg2rgb565 отдаёт RGB565 младшим байтом вперёд (см. encodePhotoJpeg).
+  // jpg2rgb565 отдаёт RGB565 младшим байтом вперёд.
   // При чтении старшим байтом вперёд шум младших битов зелёного попадал в
   // старшие разряды «яркости»: неподвижная сцена давала ~100‰ изменений,
   // и каждые 10 с писался ложный «визит».
@@ -966,12 +1327,18 @@ void analyzeFrame(unsigned long now) {
 // =====================
 // Wi-Fi / NTP
 // =====================
-void connectWiFi() {
+// wait=false — только запустить подключение: в loop ожидание по 15 с
+// останавливало детектор, пока роутера нет
+void connectWiFi(bool wait) {
   if (WiFi.status() == WL_CONNECTED) return;
 
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(DEVICE_HOSTNAME);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
+  if (!wait) {
+    Serial.println("[WiFi] reconnecting");
+    return;
+  }
   Serial.print("[WiFi] connecting");
 
   int attempts = 0;
@@ -1250,6 +1617,22 @@ void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
+  if (strncmp(action, "cam_", 4) == 0 && cameraReady) {
+    if (strcmp(action, "cam_reset") == 0) {
+      resetCamTuning();
+    } else if (doc["value"].is<int>() &&
+               (strcmp(action, "cam_ae") == 0 || strcmp(action, "cam_saturation") == 0 ||
+                strcmp(action, "cam_wb") == 0 || strcmp(action, "cam_brightness") == 0 ||
+                strcmp(action, "cam_contrast") == 0 || strcmp(action, "cam_quality") == 0)) {
+      setCamTuning(action, doc["value"].as<int>());
+    } else {
+      Serial.printf("[MQTT] %s: bad value\n", action);
+      return;
+    }
+    publishMqttTelemetry();
+    return;
+  }
+
   if (strcmp(action, "ota") == 0) {
     const char* url = doc["url"];
     if (!url || url[0] == '\0') return;
@@ -1322,7 +1705,7 @@ void ensureMqtt() {
 void publishMqttTelemetry() {
   if (!mqttClient.connected()) return;
 
-  StaticJsonDocument<768> doc;
+  StaticJsonDocument<1664> doc;
   doc["uptime"] = millis() / 1000UL;
   doc["heap"] = ESP.getFreeHeap();
   doc["camera_ready"] = cameraReady;
@@ -1335,6 +1718,14 @@ void publishMqttTelemetry() {
   doc["capture_errors"] = captureErrors;
   doc["sensor"] = sensorName;
   doc["cam_mode"] = camRgbMode ? "rgb565" : "jpeg";
+  doc["cam_ae"] = camTuning.ae;
+  doc["cam_saturation"] = camTuning.saturation;
+  doc["cam_wb"] = camTuning.wb;
+  doc["cam_brightness"] = camTuning.brightness;
+  doc["cam_contrast"] = camTuning.contrast;
+  doc["cam_quality"] = camTuning.quality;
+  doc["reset_reason"] = bootReason;
+  if (crashInfo[0]) doc["crash"] = crashInfo;
   doc["daylight"] = daylight;
   doc["motion"] = motionNow;
   doc["luma"] = frameLuma;
@@ -1376,9 +1767,15 @@ void publishMqttTelemetry() {
     doc["last_photo_url"] = url;
   }
 
-  char buf[768];
-  size_t n = serializeJson(doc, buf);
-  mqttClient.publish(topicTelemetry, buf, n);
+  // Одним publish: serializeJson прямо в mqttClient писал в сокет почти побайтно.
+  // static — не на стеке: телеметрию шлют и из глубоких вызовов (MQTT-колбэк, OTA)
+  static char buf[1536];
+  size_t n = serializeJson(doc, buf, sizeof(buf));
+  if (n == 0 || n >= sizeof(buf) - 1) {
+    Serial.printf("[MQTT] telemetry too large (%u B)\n", (unsigned)n);
+    return;
+  }
+  mqttClient.publish(topicTelemetry, (const uint8_t*)buf, n, false);
 }
 
 const char* otaPhaseLabel(const char* phase) {
@@ -1425,7 +1822,10 @@ String htmlOtaStep(const char* label, int step, int currentStep, bool failed, in
 }
 
 void publishOtaEvent(const char* phase, int progress) {
-  ensureMqtt();
+  // Во время скачивания не переподключаемся: connect + capabilities + телеметрия
+  // (sdFreeBytes() сканирует FAT) блокируют на секунды, и сервер рвёт загрузку.
+  bool transfer = strcmp(phase, "downloading") == 0 || strcmp(phase, "installing") == 0;
+  if (!transfer) ensureMqtt();
 
   StaticJsonDocument<512> doc;
   doc["ota"] = phase;
@@ -1484,10 +1884,37 @@ void setOtaProgress(const char* phase, int progress, size_t current, size_t tota
   }
   setStatus(status);
 
-  if (webServerStarted) {
+  // Пока идёт скачивание, веб-сервер не обслуживаем: /latest.jpg (до 50 КБ)
+  // или молчащий клиент держат колбэк до 5 с, а в это время стоит и загрузка.
+  bool transfer = strcmp(otaPhase, "downloading") == 0 || strcmp(otaPhase, "installing") == 0;
+  if (webServerStarted && !transfer) {
     statusServer.handleClient();
   }
   mqttClient.loop();
+}
+
+void otaWatchdogTick(void*) {
+  if (otaLastDataMs == 0) return;
+  if (millis() - otaLastDataMs > OTA_STALL_MS) {
+    Serial.println("[OTA] stalled, restart");
+    esp_restart();
+  }
+}
+
+void startOtaWatchdog() {
+  otaLastDataMs = millis();
+  if (!otaWatchdog) {
+    esp_timer_create_args_t args = {};
+    args.callback = otaWatchdogTick;
+    args.name = "ota_wdt";
+    if (esp_timer_create(&args, &otaWatchdog) != ESP_OK) return;
+  }
+  esp_timer_start_periodic(otaWatchdog, 5ULL * 1000000ULL);
+}
+
+void stopOtaWatchdog() {
+  otaLastDataMs = 0;
+  if (otaWatchdog) esp_timer_stop(otaWatchdog);
 }
 
 void queueOtaUpdate(const char* url) {
@@ -1560,6 +1987,7 @@ void performOtaUpdate(const char* url) {
 
   setOtaProgress("connecting", 0, 0, 0);
   publishOtaEvent("connecting", 0);
+  startOtaWatchdog();
 
   httpUpdate.rebootOnUpdate(true);
   httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
@@ -1572,9 +2000,10 @@ void performOtaUpdate(const char* url) {
   });
 
   httpUpdate.onProgress([](size_t current, size_t total) {
+    otaLastDataMs = millis();
     int pct = (total > 0) ? (int)((current * 100UL) / total) : 0;
     const char* phase = (pct >= 100) ? "installing" : "downloading";
-    if (pct >= lastOtaProgress + 1 || pct == 100 || lastOtaProgress < 0) {
+    if (pct >= lastOtaProgress + 5 || pct == 100 || lastOtaProgress < 0) {
       lastOtaProgress = pct;
       Serial.printf("[OTA] %s %d%% (%u/%u)\n", phase, pct, (unsigned)current, (unsigned)total);
       setOtaProgress(phase, pct, current, total);
@@ -1610,6 +2039,8 @@ void performOtaUpdate(const char* url) {
     ret = httpUpdate.update(client, url);
   }
 
+  stopOtaWatchdog();
+
   if (ret != HTTP_UPDATE_OK) {
     Serial.printf("[OTA] failed: %s\n", httpUpdate.getLastErrorString().c_str());
     if (otaFailedPhase[0] == '\0') {
@@ -1626,6 +2057,22 @@ void performOtaUpdate(const char* url) {
 // =====================
 // HTTP
 // =====================
+// otaUrl и otaErrorMsg приходят по MQTT — в HTML только экранированными
+String htmlEscape(const char* raw) {
+  String out;
+  for (const char* p = raw; *p; p++) {
+    switch (*p) {
+      case '&': out += F("&amp;"); break;
+      case '<': out += F("&lt;"); break;
+      case '>': out += F("&gt;"); break;
+      case '"': out += F("&quot;"); break;
+      case '\'': out += F("&#39;"); break;
+      default: out += *p;
+    }
+  }
+  return out;
+}
+
 String htmlRow(const char* label, const String& value, const char* valueClass) {
   String row = "<tr><td class=\"k\">";
   row += label;
@@ -1823,12 +2270,12 @@ void handleStatusPage() {
       html += htmlRow("Сбой на этапе", otaPhaseLabel(otaFailedPhase), "bad");
     }
     if (otaErrorMsg[0] != '\0') {
-      html += htmlRow("Ошибка", otaErrorMsg, "bad");
+      html += htmlRow("Ошибка", htmlEscape(otaErrorMsg), "bad");
     }
     html += F("</table>");
     if (otaUrl[0] != '\0') {
       html += F("<p class=\"ota-url\">");
-      html += otaUrl;
+      html += htmlEscape(otaUrl);
       html += F("</p>");
     }
     html += F("</section>");
@@ -1865,6 +2312,9 @@ void handleStatusPage() {
     html += htmlRow("Свободно", String(sdFreeBytes() / (1024ULL * 1024ULL)) + " MB");
   }
   html += htmlRow("Сенсор", String(sensorName) + (camRgbMode ? " · RGB565 VGA" : " · JPEG SVGA"));
+  html += htmlRow("Цвет", "экспозиция " + String(camTuning.ae) + ", насыщенность " +
+                              String(camTuning.saturation) + ", баланс белого " + String(camTuning.wb) +
+                              (camTuningSaved ? "" : " (по умолчанию)"));
   html += htmlRow("Светло", daylight ? "Да" : "Нет (ночной режим)", daylight ? "ok" : "warn");
   html += htmlRow("Яркость", String(frameLuma));
   html += htmlRow("Движение", String(motionPermille) + "‰" + (motionNow ? " — движение" : ""),
@@ -1930,6 +2380,7 @@ void setup() {
   Serial.println();
   Serial.println("ESP32-CAM birdfeeder");
   logFirmwareInfo("esp32-bird-cam");
+  readBootDiagnostics();
   logPartitionInfo();
 
   littleFsReady = LittleFS.begin(true, "/littlefs", 10, "spiffs");
@@ -1945,6 +2396,14 @@ void setup() {
   }
 
   loadBirdLog();
+  loadBirdVisits();
+
+  // Сенсор уже показал, что аппаратный JPEG не работает: сразу RGB565,
+  // без пяти пустых кадров после каждой перезагрузки
+  if (littleFsReady && LittleFS.exists(CAM_RGB_FLAG_FILE)) {
+    camRgbMode = true;
+    Serial.println("[Camera] RGB565 mode remembered");
+  }
 
   setStatus("Init camera");
   if (!initCamera()) {
@@ -1982,9 +2441,16 @@ void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     if (now - lastWifiRetry >= WIFI_RETRY_INTERVAL) {
       lastWifiRetry = now;
-      connectWiFi();
+      connectWiFi(false);
     }
   } else {
+    // Wi-Fi не было при загрузке (роутер после отключения света встаёт дольше):
+    // без времени нет меток на снимках, журнала /birds.json и сброса счётчика в полночь
+    if (time(nullptr) < 100000 && now - lastNtpAttempt >= NTP_RETRY_INTERVAL) {
+      lastNtpAttempt = now;
+      configTime(NTP_GMT_OFFSET_SEC, 0, "pool.ntp.org", "time.google.com");
+      Serial.println("[NTP] sync requested");
+    }
     ensureWebServer();
     ensureMqtt();
     mqttClient.loop();
@@ -2015,9 +2481,11 @@ void loop() {
     if (!sdReady) {
       initSdCard();
     }
-    if (cameraReady && sdReady) {
+    // Кадр мог уже уйти на SD как снимок визита в analyzeFrame
+    if (cameraReady && sdReady && savedFrameAtMs != frameAtMs) {
       captureAndSavePhoto();
     }
+    publishMqttTelemetry();
   }
 
   delay(10);

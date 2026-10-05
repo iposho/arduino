@@ -20,7 +20,7 @@
 | default | `esp32-default` | `esp32_default` | default | Универсальная заготовка для новой платы |
 | flat | `esp32-flat` | `esp32_flat_bme280` | default | Комнатный TFT + BME280/AHT/ENS160 |
 | balcony | `esp32-balcony` | `esp32_balcony_pms5003_bme280` | default | Балкон: BME280 + PMS5003 + OLED |
-| birdcam | `esp32-bird-cam` | `esp32_bird_cam` | **min_spiffs** | ESP32-CAM у кормушки: кадр 1 fps в RAM (`/latest.jpg`), детектор птиц, снимки птиц на SD (`/photo?id=`, `/birds.json`) |
+| birdcam | `esp32-bird-cam` | `esp32_bird_cam` | **min_spiffs** | ESP32-CAM у кормушки: кадр 1 fps в RAM (`/latest.jpg`), детектор движения, снимки визитов на SD (`/photo?id=`, `/birds.json`) |
 | flamingo | `esp32-flamingo` | `esp32_flamingo` | default | Вывеска PWM GPIO 13 + гирлянда GPIO 33 + стробоскоп GPIO 25 + кнопка GPIO 27 |
 
 ## MQTT
@@ -58,6 +58,17 @@
 | flat, balcony | Показывает системный экран на дисплее |
 | flamingo, birdcam | Команды нет в capabilities |
 
+## birdcam (esp32-bird-cam)
+
+- Команды цвета сенсора (`cam_ae`, `cam_saturation`, `cam_wb`, `cam_brightness`, `cam_contrast`, `cam_quality`, сброс `cam_reset`) — с дашборда, хранятся в LittleFS `/cam_tuning.dat` (сохранённые поля видны в телеметрии `cam_*`, а не в HTML статуса).
+  - Каждая команда сохраняет настройку, применяет её и **сбрасывает фон детектора** — иначе пересвет выглядит как движение.
+- Служебные `fs_ls` / `fs_read` / `fs_write` / `fs_rm` (`path`, `content`) для LittleFS (в `capabilities` не публикуются).
+- Файлы состояния: `/cam_tuning.dat`, `/cam_rgb.flag`, `/bird_log.dat`, `/bird_visits.dat`, `/photo_index.dat`.
+- Телеметрия дополнительно: `cam_mode` (`jpeg` / `rgb565`), `cam_*`, `reset_reason`, `crash` (выжимка coredump: `pc`, `cause`, `bt`). Адреса `bt` разворачиваются через `addr2line` и `.elf` этой сборки.
+- Детектор — разница кадра 1/8 с медленным фоном; птицу определяет шлюз нейронкой. Снимки на SD — только по движению и `capture`, не чаще раза в 10 с.
+- SD под кольцо меньше 4800 фото: при свободном месте < 4 МБ вытесняются самые старые `/photos/NNNNN.jpg`.
+- OTA-сторож: нет новых байт > 60 с — ребут (старая прошивка остаётся в слоте). Во время скачивания не переподключать MQTT и не обслуживать веб-сервер (сканирование FAT и `/latest.jpg` рвут загрузку).
+
 ## Изменение прошивки
 
 1. Читай `include/firmware_manifest.json` перед работой.
@@ -83,5 +94,5 @@
 - Считать, что `led` включён по умолчанию — в коде всегда `false`; «включён» в UI = устаревшая телеметрия.
 - Путать GPIO 33: кнопка на flat (вывеска), гирлянда на flamingo.
 - Для birdcam использовать partition Huge APP или Default — нужен **min_spiffs**.
-- birdcam: сначала аппаратный JPEG SVGA; если 5 кадров подряд не пришло (у OV3660 на AI-Thinker — `cam_hal: FB-OVF`), прошивка сама переходит на RGB565 VGA + программный JPEG (`cam_mode` в телеметрии). Детектор работает на кадре 1/8 (≤100×75, `MOTION_MAX_*`).
+- birdcam: сначала аппаратный JPEG SVGA (XGA на OV3660 не работает — FB-OVF, проверено в 1.3.1); если 5 кадров подряд не пришло (у OV3660 на AI-Thinker — `cam_hal: FB-OVF`), прошивка сама переходит на RGB565 VGA + программный JPEG (`cam_mode` в телеметрии). Детектор работает на кадре 1/8 (≤100×75, `MOTION_MAX_*`, буфер должен вмещать весь кадр / 8).
 - birdcam: `capture` сохраняет текущий кадр на SD; периодической съёмки на SD больше нет — только визиты птиц (не чаще раза в 10 с).
