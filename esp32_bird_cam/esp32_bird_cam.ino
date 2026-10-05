@@ -542,6 +542,15 @@ bool encodePhotoJpeg(uint8_t** outBuf, size_t* outLen, bool* outAllocated) {
     return true;
   }
 
+  // esp_jpeg отдаёт пиксели как R,G,B, а fmt2jpg(PIXFORMAT_RGB888) читает B,G,R
+  // (порядок BMP). Без перестановки красный и синий меняются местами:
+  // небо персиковое, кормушка синяя, пересветы розовые (так было в 1.4.0).
+  for (size_t i = 0; i + 2 < rgbLen; i += 3) {
+    uint8_t t = rgb[i];
+    rgb[i] = rgb[i + 2];
+    rgb[i + 2] = t;
+  }
+
   drawTimestamp888(rgb, w, h, ts);
   bool ok = fmt2jpg(rgb, rgbLen, w, h, PIXFORMAT_RGB888, JPEG_SAVE_QUALITY, outBuf, outLen);
   free(rgb);
@@ -1071,6 +1080,38 @@ static bool storeFrame(const uint8_t* jpg, size_t len) {
   return true;
 }
 
+// OV3660 в пересвете: зелёный канал упирается в предел раньше красного и синего,
+// после усилений баланса белого белое (бумага, светлое оперение) становится
+// сиренево-розовым — и нейронка шлюза путается. Где G — самый слабый канал,
+// а max(R, B) у предела, плавно тянем R и G к max(R, B):
+// 190 → без изменений, 240+ → нейтрально-белый. Голубое небо (R слабее G)
+// и тёмные пурпурные предметы не трогаются.
+// RGB565 сенсора — старшим байтом вперёд (как ждёт frame2jpg).
+const uint8_t HIGHLIGHT_FIX_FROM = 190;
+const uint8_t HIGHLIGHT_FIX_SPAN = 50;
+
+void fixPinkHighlights565(uint8_t* buf, size_t len) {
+  for (size_t i = 0; i + 1 < len; i += 2) {
+    const uint8_t hi = buf[i];
+    const uint8_t lo = buf[i + 1];
+    const uint8_t r5 = hi >> 3;
+    const uint8_t b5 = lo & 0x1F;
+    if (max(r5, b5) < (HIGHLIGHT_FIX_FROM >> 3)) continue;
+    const uint8_t r = (r5 << 3) | (r5 >> 2);
+    const uint8_t b = (b5 << 3) | (b5 >> 2);
+    const uint8_t g6 = ((hi & 0x07) << 3) | (lo >> 5);
+    const uint8_t g = (g6 << 2) | (g6 >> 4);
+    const uint8_t m = max(r, b);
+    if (m < HIGHLIGHT_FIX_FROM || g >= r || g >= b) continue;
+    const uint16_t k = min<uint16_t>(m - HIGHLIGHT_FIX_FROM, HIGHLIGHT_FIX_SPAN);
+    const uint8_t nr = r + (uint16_t)(m - r) * k / HIGHLIGHT_FIX_SPAN;
+    const uint8_t ng = g + (uint16_t)(m - g) * k / HIGHLIGHT_FIX_SPAN;
+    const uint8_t ng6 = ng >> 2;
+    buf[i] = (nr & 0xF8) | (ng6 >> 3);
+    buf[i + 1] = ((ng6 & 0x07) << 5) | b5;
+  }
+}
+
 bool grabFrame() {
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb || fb->len == 0) {
@@ -1086,6 +1127,7 @@ bool grabFrame() {
   camFailStreak = 0;
 
   if (fb->format != PIXFORMAT_JPEG) {
+    if (fb->format == PIXFORMAT_RGB565) fixPinkHighlights565(fb->buf, fb->len);
     uint8_t* jpg = nullptr;
     size_t jpgLen = 0;
     bool ok = frame2jpg(fb, JPEG_SOFT_QUALITY, &jpg, &jpgLen);
