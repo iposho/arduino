@@ -157,7 +157,8 @@ ESP32 DevKit + BME280 + 1.8" TFT ST7735 + джойстик.
 
 - Показывает температуру, влажность, давление (локальные и с балкона через Supabase)
 - AQI-индекс (EPA) на основе PM2.5/PM10 с балкона
-- Экраны: **Home**, **Outdoor**, **AQI**
+- Экраны: **Home**, **Outdoor**, **Indoor air**, **AQI**, **Bird feeder**
+- **Bird feeder** — последняя подтверждённая птица с кормушки: шлюз отдаёт готовый RGB565 160×120 (`/api/camera/birdfeeder/tft`), под снимком латинское название и время. Пока экран открыт, проверка новой птицы раз в 30 с. Нужен `CAMERA_API_TOKEN` шлюза в `secrets.h`
 - Оверлеи: **Time** (кнопка джойстика), **System info** (вниз на джойстике)
 - Навигация джойстиком (лево/право — экраны, кнопка — часы, вниз — info)
 - EMA-фильтр показаний BME280 (α=0.1)
@@ -368,7 +369,7 @@ ESP32 DevKit + неоновая вывеска на GPIO 13 (PWM) + гирлян
 
 | Цель | Плата | Partition | Версия* | Пример файла |
 |------|-------|-----------|---------|--------------|
-| `flat` | ESP32 Dev Module | Default | 1.2.9 | `ota/esp32-flat-1.2.9-20260730.bin` |
+| `flat` | ESP32 Dev Module | Default | 1.3.0 | `ota/esp32-flat-1.3.0-20261007.bin` |
 | `balcony` | ESP32 Dev Module | Default | 1.2.0 | `ota/esp32-balcony-1.2.0-20260730.bin` |
 | `birdcam` | AI Thinker ESP32-CAM | min_spiffs | 1.4.2 | `ota/esp32-bird-cam-1.4.2-20261006.bin` |
 | `flamingo` | ESP32 Dev Module | Default | 1.0.12 | `ota/esp32-flamingo-1.0.12-20260918.bin` |

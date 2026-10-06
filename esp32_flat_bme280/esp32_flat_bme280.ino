@@ -20,6 +20,14 @@
 // Секреты — вынесены в secrets.h (.gitignore)
 // =====================
 #include "secrets.h"
+
+// Шлюз (Next.js) живёт на том же Pi, что и брокер; токен — CAMERA_API_TOKEN шлюза
+#ifndef GATEWAY_URL
+#define GATEWAY_URL "http://" MQTT_HOST ":3000"
+#endif
+#ifndef CAMERA_API_TOKEN
+#define CAMERA_API_TOKEN ""
+#endif
 #include "firmware_info.h"
 #include "../include/ota_mqtt.h"
 
@@ -156,10 +164,24 @@ enum Screen {
   SCREEN_OUTDOOR,
   SCREEN_INDOOR,
   SCREEN_AQI,
+  SCREEN_BIRD,
   SCREEN_COUNT
 };
 
 Screen currentScreen = SCREEN_HOME;
+
+// =====================
+// Bird feeder photo
+// =====================
+// Шлюз отдаёт последнюю подтверждённую птицу готовым RGB565 (little-endian),
+// строки льются прямо в дисплей. Под картинкой 4:3 остаётся строка подписи.
+#define BIRD_IMG_W 160
+#define BIRD_IMG_H 120
+const unsigned long BIRD_REFRESH_INTERVAL = 30UL * 1000UL;
+
+// ETag снимка на экране; пустой — картинки нет, качать целиком
+char birdEtag[40] = "";
+unsigned long lastBirdFetch = 0;
 
 // =====================
 // UI colors
@@ -346,6 +368,8 @@ void feedEns160EnvData();
 void dismissScreenAlerts();
 void checkScreenAlerts();
 void drawCurrentScreen();
+void drawBirdScreen();
+void fetchBirdPhoto(bool force);
 void drawTimeScreen();
 void drawInfoScreen();
 void drawStatusBar();
@@ -448,7 +472,8 @@ void setStatus(const char* status) {
   strncpy(statusLine, status, sizeof(statusLine) - 1);
   statusLine[sizeof(statusLine) - 1] = '\0';
 
-  if (!showingTimeScreen && !showingInfoScreen) {
+  // На экране кормушки строки статуса нет — она легла бы поверх снимка
+  if (!showingTimeScreen && !showingInfoScreen && currentScreen != SCREEN_BIRD) {
     drawStatusBar();
   }
 }
@@ -1985,6 +2010,134 @@ void drawNoBmeScreen() {
   drawStatusBar();
 }
 
+void drawBirdMessage(const char* line1, const char* line2) {
+  birdEtag[0] = '\0';
+
+  tft.fillScreen(COLOR_BG);
+  drawHeader("Bird feeder", COLOR_GREEN);
+  drawCard(8, 38, 144, 56, "LAST BIRD", COLOR_GREEN);
+
+  tft.setTextColor(COLOR_TEXT);
+  tft.setTextSize(2);
+  tft.setCursor(16, 56);
+  tft.print(line1);
+
+  tft.setTextColor(COLOR_MUTED);
+  tft.setTextSize(1);
+  tft.setCursor(16, 80);
+  tft.print(line2);
+}
+
+void drawBirdCaption(const char* species, time_t shotAt) {
+  const int y = BIRD_IMG_H;
+  const int maxChars = tft.width() / 6;
+
+  char when[16] = "";
+  if (shotAt > 100000) {
+    time_t now = time(nullptr);
+    struct tm shot, today;
+    localtime_r(&shotAt, &shot);
+    localtime_r(&now, &today);
+
+    if (shot.tm_year == today.tm_year && shot.tm_yday == today.tm_yday) {
+      snprintf(when, sizeof(when), "%02d:%02d", shot.tm_hour, shot.tm_min);
+    } else {
+      snprintf(when, sizeof(when), "%02d.%02d %02d:%02d",
+               shot.tm_mday, shot.tm_mon + 1, shot.tm_hour, shot.tm_min);
+    }
+  }
+
+  tft.fillRect(0, y, tft.width(), tft.height() - y, ST77XX_BLACK);
+  tft.setTextSize(1);
+
+  tft.setTextColor(COLOR_TEXT);
+  tft.setCursor(1, y);
+  tft.printf("%.*s", maxChars - (int)strlen(when) - 1, species[0] ? species : "Bird");
+
+  tft.setTextColor(COLOR_MUTED);
+  tft.setCursor(tft.width() - 6 * (int)strlen(when), y);
+  tft.print(when);
+}
+
+// force — экран только что открыт, картинки на нём нет: качаем целиком и
+// показываем ошибки. Иначе это фоновая проверка: шлюз ответит 304, пока
+// птица та же, а при сбое на экране остаётся прежний снимок.
+void fetchBirdPhoto(bool force) {
+  lastBirdFetch = millis();
+
+  if (CAMERA_API_TOKEN[0] == '\0') {
+    if (force) drawBirdMessage("No token", "CAMERA_API_TOKEN");
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    if (force) drawBirdMessage("No WiFi", "Photo unavailable");
+    return;
+  }
+
+  HTTPClient http;
+  http.setConnectTimeout(3000);
+  http.setTimeout(5000);
+  http.begin(GATEWAY_URL "/api/camera/birdfeeder/tft");
+  http.addHeader("Authorization", "Bearer " CAMERA_API_TOKEN);
+  if (!force && birdEtag[0] != '\0') http.addHeader("If-None-Match", birdEtag);
+
+  const char* keep[] = { "ETag", "X-Shot-At", "X-Species" };
+  http.collectHeaders(keep, 3);
+
+  int code = http.GET();
+  if (code == 304) {
+    http.end();
+    return;
+  }
+
+  if (code != 200 || http.getSize() != BIRD_IMG_W * BIRD_IMG_H * 2) {
+    Serial.printf("[Bird] fetch failed: code=%d size=%d\n", code, http.getSize());
+    http.end();
+    if (force) {
+      char line[24];
+      if (code == 404) snprintf(line, sizeof(line), "No birds yet");
+      else if (code == 401) snprintf(line, sizeof(line), "Bad token (401)");
+      else snprintf(line, sizeof(line), "Gateway: %d", code);
+      drawBirdMessage("No photo", line);
+    }
+    return;
+  }
+
+  String etag = http.header("ETag");
+  String species = http.header("X-Species");
+  time_t shotAt = (time_t)strtoul(http.header("X-Shot-At").c_str(), nullptr, 10);
+
+  static uint16_t row[BIRD_IMG_W];
+  WiFiClient* stream = http.getStreamPtr();
+  bool ok = true;
+
+  for (int y = 0; y < BIRD_IMG_H; y++) {
+    if (stream->readBytes((uint8_t*)row, sizeof(row)) != sizeof(row)) {
+      ok = false;
+      break;
+    }
+    tft.drawRGBBitmap(0, y, row, BIRD_IMG_W, 1);
+  }
+  http.end();
+
+  if (!ok) {
+    Serial.println("[Bird] photo stream cut");
+    if (force) drawBirdMessage("No photo", "Download cut");
+    else birdEtag[0] = '\0';
+    return;
+  }
+
+  strncpy(birdEtag, etag.c_str(), sizeof(birdEtag) - 1);
+  birdEtag[sizeof(birdEtag) - 1] = '\0';
+  drawBirdCaption(species.c_str(), shotAt);
+  Serial.printf("[Bird] photo %s (%s)\n", birdEtag, species.c_str());
+}
+
+void drawBirdScreen() {
+  drawBirdMessage("Loading", "Last bird at the feeder");
+  fetchBirdPhoto(true);
+}
+
 void drawCurrentScreen() {
   if (!bmeReady && currentScreen == SCREEN_HOME) {
     drawNoBmeScreen();
@@ -2049,6 +2202,9 @@ void drawCurrentScreen() {
   }
   else if (currentScreen == SCREEN_AQI) {
     drawAqiScreen();
+  }
+  else if (currentScreen == SCREEN_BIRD) {
+    drawBirdScreen();
   }
 }
 
@@ -2265,6 +2421,10 @@ void loop() {
   if (now - lastFetchTime >= FETCH_INTERVAL || lastFetchTime == 0) {
     fetchWeatherFromSupabase();
     lastFetchTime = now;
+  }
+
+  if (currentScreen == SCREEN_BIRD && millis() - lastBirdFetch >= BIRD_REFRESH_INTERVAL) {
+    fetchBirdPhoto(false);
   }
 
   delay(50);

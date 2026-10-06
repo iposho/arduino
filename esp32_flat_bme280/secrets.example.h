@@ -25,3 +25,9 @@
 // Supabase REST API (чтение уличных данных + запись комнатных)
 #define SUPABASE_URL     "https://your-project.supabase.co/rest/v1"
 #define SUPABASE_KEY     "your-supabase-anon-key"
+
+// Экран «Bird feeder»: последняя птица с кормушки через шлюз
+// (/api/camera/birdfeeder/tft). Токен — CAMERA_API_TOKEN из .env шлюза;
+// без него экран покажет «No token». GATEWAY_URL по умолчанию — http://<MQTT_HOST>:3000
+// #define GATEWAY_URL      "http://192.168.100.43:3000"
+#define CAMERA_API_TOKEN "change-me-camera-token"

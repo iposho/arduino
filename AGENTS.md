@@ -76,6 +76,13 @@
 3. После релизной сборки: `./scripts/build-ota.sh <id>` → закоммить обновлённый `firmware_manifest.json` (`last_build` пишет скрипт).
 4. `ota/` в `.gitignore` — бинарники локальные.
 
+## flat: экран кормушки
+
+- `SCREEN_BIRD` рисует последнюю подтверждённую птицу: `GET <GATEWAY_URL>/api/camera/birdfeeder/tft` (репозиторий шлюза, `lib/bird-tft.ts`) с `Authorization: Bearer <CAMERA_API_TOKEN>` — оба в `secrets.h`; `GATEWAY_URL` по умолчанию `http://<MQTT_HOST>:3000`.
+- Ответ — сырой RGB565 little-endian 160×120, плата льёт его построчно в дисплей (JPEG на плате не декодируется). Подпись — из заголовков `X-Species` (латынь: в шрифте нет кириллицы) и `X-Shot-At`.
+- Картинка в памяти не хранится: при каждом входе на экран качается заново, дальше раз в 30 с запрос с `If-None-Match` (304, пока птица та же).
+- На этом экране `setStatus()` не рисует строку статуса — она легла бы поверх снимка.
+
 ## Flamingo ↔ Flat
 
 - Flat не может писать в `devices/esp32-flamingo/command` (ACL Mosquitto).
