@@ -572,8 +572,54 @@ String photoPathForIndex(uint16_t index) {
 static uint64_t sdFreeCache = 0;
 static unsigned long sdFreeCacheMs = 0;
 static bool sdFreeCacheValid = false;
-// Самый старый ещё не вытесненный индекс (только до заполнения кольца)
-static uint16_t sdEvictedUpTo = 0;
+// Какие /photos/NNNNN.jpg есть на карте. Спрашивать у FAT нельзя: поиск файла —
+// линейный проход по папке, а SD_MMC.exists() на отсутствующем файле проходит её
+// трижды (fopen, stat, opendir). При тысячах снимков циклы таких проверок
+// (восстановление индекса, вытеснение) вешали плату на минуты без Wi-Fi и MQTT.
+// Карта заполняется одним чтением папки при монтировании.
+static uint8_t photoMap[(MAX_PHOTOS + 7) / 8];
+static uint16_t photoCount = 0;
+
+static bool photoExists(uint16_t index) {
+  return index < MAX_PHOTOS && (photoMap[index >> 3] & (1 << (index & 7)));
+}
+
+static void photoMark(uint16_t index, bool present) {
+  if (index >= MAX_PHOTOS || photoExists(index) == present) return;
+  if (present) {
+    photoMap[index >> 3] |= (1 << (index & 7));
+    photoCount++;
+  } else {
+    photoMap[index >> 3] &= ~(1 << (index & 7));
+    photoCount--;
+  }
+}
+
+static void scanPhotosDir() {
+  memset(photoMap, 0, sizeof(photoMap));
+  photoCount = 0;
+  unsigned long t0 = millis();
+  File dir = SD_MMC.open(PHOTOS_DIR);
+  if (!dir || !dir.isDirectory()) {
+    Serial.println("[SD] open /photos failed");
+    return;
+  }
+  // getNextFileName() — только readdir: openNextFile() делал бы stat каждого файла
+  for (String name = dir.getNextFileName(); name.length(); name = dir.getNextFileName()) {
+    const char* base = strrchr(name.c_str(), '/');
+    base = base ? base + 1 : name.c_str();
+    if (strlen(base) != 9 || strcasecmp(base + 5, ".jpg") != 0) continue;
+    uint16_t index = 0;
+    bool digits = true;
+    for (int i = 0; i < 5; i++) {
+      if (base[i] < '0' || base[i] > '9') { digits = false; break; }
+      index = index * 10 + (base[i] - '0');
+    }
+    if (digits) photoMark(index, true);
+  }
+  dir.close();
+  Serial.printf("[SD] %u photos, dir scan %lu ms\n", photoCount, millis() - t0);
+}
 
 static void refreshSdFreeCache() {
   sdFreeCache = sdReady ? (SD_MMC.totalBytes() - SD_MMC.usedBytes()) : 0;
@@ -869,6 +915,7 @@ bool initSdCard() {
 
   sdReady = true;
   sdFreeCacheValid = false;  // после (пере)монтирования кэш свободного места устарел
+  scanPhotosDir();
   Serial.printf("[SD] OK, free %llu MB\n", sdFreeBytes() / (1024ULL * 1024ULL));
   restorePhotoIndex();
   return true;
@@ -905,7 +952,7 @@ bool loadPhotoIndexFromFs() {
   photoIndex = saved;
   uint16_t prev = (saved == 0) ? (uint16_t)(MAX_PHOTOS - 1) : (uint16_t)(saved - 1);
   String lastPath = photoPathForIndex(prev);
-  if (SD_MMC.exists(lastPath)) {
+  if (photoExists(prev)) {
     strncpy(lastPhotoPath, lastPath.c_str(), sizeof(lastPhotoPath) - 1);
     lastPhotoPath[sizeof(lastPhotoPath) - 1] = '\0';
     lastCaptureOk = true;
@@ -923,17 +970,11 @@ void restorePhotoIndex() {
     return;
   }
 
-  Serial.println("[SD] scanning card (first boot, may take a minute)...");
-
   uint16_t maxIndex = 0;
   bool found = false;
   for (uint16_t i = 0; i < MAX_PHOTOS; i++) {
-    if ((i % 200) == 0) {
-      Serial.printf("[SD] scan %u/%u\n", i, MAX_PHOTOS);
-      yield();
-    }
-    if (SD_MMC.exists(photoPathForIndex(i))) {
-      if (i >= maxIndex) maxIndex = i;
+    if (photoExists(i)) {
+      maxIndex = i;
       found = true;
     }
   }
@@ -956,15 +997,17 @@ void restorePhotoIndex() {
 // места не требует — кластеры освободит сама запись. Новый файл на карте
 // меньшей, чем 4800 фото, иначе встал бы намертво с момента заполнения:
 // вытесняем самые старые снимки, пока не наберётся SD_FREE_MIN_BYTES.
-// false — места нет и вытеснять нечего.
-static bool ensureSdRoom(const String& path) {
-  if (SD_MMC.exists(path)) return true;
+// Самый старый — первый существующий после photoIndex по кольцу (и до первого
+// оборота, и после). false — места нет и вытеснять нечего.
+static bool ensureSdRoom(uint16_t index) {
+  if (photoExists(index)) return true;
   if (sdFreeBytes() >= SD_FREE_MIN_BYTES) return true;
 
   Serial.println("[SD] low on space — evicting oldest photos");
-  for (uint16_t i = sdEvictedUpTo; i < photoIndex; i++) {
+  for (uint16_t step = 1; step < MAX_PHOTOS; step++) {
+    const uint16_t i = (index + step) % MAX_PHOTOS;
+    if (!photoExists(i)) continue;
     String old = photoPathForIndex(i);
-    if (!SD_MMC.exists(old)) continue;
     File f = SD_MMC.open(old, FILE_READ);
     uint64_t sz = f ? (uint64_t)f.size() : 0;
     if (f) f.close();
@@ -972,7 +1015,7 @@ static bool ensureSdRoom(const String& path) {
       Serial.printf("[SD] evict %s failed\n", old.c_str());
       continue;
     }
-    sdEvictedUpTo = i + 1;
+    photoMark(i, false);
     if (sdFreeCacheValid) sdFreeCache += sz;
     sdFreeCacheMs = millis();
     Serial.printf("[SD] evicted %s (%llu B)\n", old.c_str(), (unsigned long long)sz);
@@ -989,14 +1032,14 @@ bool captureAndSavePhoto() {
   }
 
   String path = photoPathForIndex(photoIndex);
-  if (!ensureSdRoom(path)) {
+  if (!ensureSdRoom(photoIndex)) {
     Serial.println("[Capture] SD full — no photos to evict");
     lastCaptureOk = false;
     captureErrors++;
     setStatus("SD full");
     return false;
   }
-  bool newFile = !SD_MMC.exists(path);
+  bool newFile = !photoExists(photoIndex);
   File file = SD_MMC.open(path, FILE_WRITE);
   if (!file) {
     Serial.printf("[Capture] open %s failed\n", path.c_str());
@@ -1031,6 +1074,7 @@ bool captureAndSavePhoto() {
   lastPhotoPath[sizeof(lastPhotoPath) - 1] = '\0';
   savedFrameAtMs = frameAtMs;
   if (newFile && sdFreeCacheValid && sdFreeCache >= written) sdFreeCache -= written;
+  photoMark(photoIndex, true);
 
   photoIndex = (photoIndex + 1) % MAX_PHOTOS;
   captureCount++;
@@ -1121,7 +1165,19 @@ bool grabFrame() {
     if (frameErrors % 10 == 1) {
       Serial.printf("[Frame] fb_get failed (errors=%lu)\n", (unsigned long)frameErrors);
     }
-    if (!camRgbMode && camFailStreak >= JPEG_FAIL_FALLBACK) switchToRgbMode();
+    if (camFailStreak >= JPEG_FAIL_FALLBACK) {
+      if (!camRgbMode) {
+        switchToRgbMode();
+      } else {
+        // В RGB565 падать дальше некуда: переинициализация сенсора. Не поднялся —
+        // loop() повторит initCamera() через FRAME_INTERVAL_NIGHT_MS.
+        Serial.println("[Camera] no frames in RGB565 — reinit");
+        esp_camera_deinit();
+        cameraReady = false;
+        initCamera();
+        publishMqttTelemetry();
+      }
+    }
     return false;
   }
   camFailStreak = 0;
@@ -1754,6 +1810,7 @@ void publishMqttTelemetry() {
   doc["sd_ready"] = sdReady;
   doc["led"] = flashLedOn;
   doc["sd_free_mb"] = sdFreeBytes() / (1024ULL * 1024ULL);
+  doc["sd_photos"] = photoCount;
   doc["photo_index"] = photoIndex;
   doc["capture_count"] = captureCount;
   doc["last_capture_ok"] = lastCaptureOk;
@@ -2452,14 +2509,17 @@ void setup() {
     setStatus("Camera error");
   }
 
+  connectWiFi();
+  ensureWebServer();
+  ensureMqtt();
+
+  // SD после сети: монтирование читает FAT и папку /photos, на большой или
+  // сбойной карте это секунды — плата к этому моменту уже видна в MQTT
   setStatus("Init SD");
   if (!initSdCard()) {
     setStatus("SD error");
   }
-
-  connectWiFi();
-  ensureWebServer();
-  ensureMqtt();
+  publishMqttTelemetry();
 
   if (WiFi.status() == WL_CONNECTED) {
     syncTime();
