@@ -1437,18 +1437,19 @@ void handleJoystick() {
     return;
   }
 
-  // Реализация сквозного циклического переключения экранов
+  // Реализация сквозного циклического переключения экранов.
+  // Джойстик стоит так, что малые значения X — это наклон вправо: вправо — вперёд
   if (x <= JOY_LEFT_THRESHOLD) {
-    currentScreen = (Screen)(((int)currentScreen - 1 + SCREEN_COUNT) % SCREEN_COUNT);
+    currentScreen = (Screen)(((int)currentScreen + 1) % SCREEN_COUNT);
     screenChanged = true;
-    Serial.print("LEFT -> screen ");
+    Serial.print("RIGHT -> screen ");
     Serial.println((int)currentScreen);
   }
 
   if (x >= JOY_RIGHT_THRESHOLD) {
-    currentScreen = (Screen)(((int)currentScreen + 1) % SCREEN_COUNT);
+    currentScreen = (Screen)(((int)currentScreen - 1 + SCREEN_COUNT) % SCREEN_COUNT);
     screenChanged = true;
-    Serial.print("RIGHT -> screen ");
+    Serial.print("LEFT -> screen ");
     Serial.println((int)currentScreen);
   }
 
