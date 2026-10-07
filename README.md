@@ -371,7 +371,7 @@ ESP32 DevKit + неоновая вывеска на GPIO 13 (PWM) + гирлян
 
 | Цель | Плата | Partition | Версия* | Пример файла |
 |------|-------|-----------|---------|--------------|
-| `flat` | ESP32 Dev Module | Default | 1.3.0 | `ota/esp32-flat-1.3.0-20261007.bin` |
+| `flat` | ESP32 Dev Module | Default | 1.3.1 | `ota/esp32-flat-1.3.1-20261007.bin` |
 | `balcony` | ESP32 Dev Module | Default | 1.2.0 | `ota/esp32-balcony-1.2.0-20260730.bin` |
 | `birdcam` | AI Thinker ESP32-CAM | min_spiffs | 1.4.2 | `ota/esp32-bird-cam-1.4.2-20261006.bin` |
 | `flamingo` | ESP32 Dev Module | Default | 1.0.12 | `ota/esp32-flamingo-1.0.12-20260918.bin` |

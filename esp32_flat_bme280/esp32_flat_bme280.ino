@@ -2010,6 +2010,46 @@ void drawNoBmeScreen() {
   drawStatusBar();
 }
 
+// Приёмник тела ответа: копит строку пикселей и сразу выводит её на дисплей
+class BirdRowSink : public Stream {
+ public:
+  void reset() {
+    fill = 0;
+    y = 0;
+    total = 0;
+  }
+
+  size_t write(uint8_t b) override { return write(&b, 1); }
+
+  size_t write(const uint8_t* buf, size_t len) override {
+    total += len;
+    for (size_t i = 0; i < len && y < BIRD_IMG_H;) {
+      size_t n = min(len - i, sizeof(row) - fill);
+      memcpy((uint8_t*)row + fill, buf + i, n);
+      fill += n;
+      i += n;
+      if (fill == sizeof(row)) {
+        tft.drawRGBBitmap(0, y++, row, BIRD_IMG_W, 1);
+        fill = 0;
+      }
+    }
+    return len;
+  }
+
+  int available() override { return 0; }
+  int read() override { return -1; }
+  int peek() override { return -1; }
+
+  bool complete() const { return total == sizeof(row) * BIRD_IMG_H; }
+  size_t received() const { return total; }
+
+ private:
+  uint16_t row[BIRD_IMG_W];
+  size_t fill = 0;
+  size_t total = 0;
+  int y = 0;
+};
+
 void drawBirdMessage(const char* line1, const char* line2) {
   birdEtag[0] = '\0';
 
@@ -2090,8 +2130,8 @@ void fetchBirdPhoto(bool force) {
     return;
   }
 
-  if (code != 200 || http.getSize() != BIRD_IMG_W * BIRD_IMG_H * 2) {
-    Serial.printf("[Bird] fetch failed: code=%d size=%d\n", code, http.getSize());
+  if (code != 200) {
+    Serial.printf("[Bird] fetch failed: code=%d\n", code);
     http.end();
     if (force) {
       char line[24];
@@ -2107,21 +2147,14 @@ void fetchBirdPhoto(bool force) {
   String species = http.header("X-Species");
   time_t shotAt = (time_t)strtoul(http.header("X-Shot-At").c_str(), nullptr, 10);
 
-  static uint16_t row[BIRD_IMG_W];
-  WiFiClient* stream = http.getStreamPtr();
-  bool ok = true;
-
-  for (int y = 0; y < BIRD_IMG_H; y++) {
-    if (stream->readBytes((uint8_t*)row, sizeof(row)) != sizeof(row)) {
-      ok = false;
-      break;
-    }
-    tft.drawRGBBitmap(0, y, row, BIRD_IMG_W, 1);
-  }
+  // Шлюз отдаёт тело чанками (без Content-Length) — их разбирает writeToStream
+  static BirdRowSink sink;
+  sink.reset();
+  int written = http.writeToStream(&sink);
   http.end();
 
-  if (!ok) {
-    Serial.println("[Bird] photo stream cut");
+  if (!sink.complete()) {
+    Serial.printf("[Bird] photo stream cut: rc=%d bytes=%u\n", written, (unsigned)sink.received());
     if (force) drawBirdMessage("No photo", "Download cut");
     else birdEtag[0] = '\0';
     return;
