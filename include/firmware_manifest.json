@@ -53,7 +53,7 @@
     },
     "default": {
       "sketch": "esp32_default",
-      "version": "1.0.1",
+      "version": "1.0.2",
       "ota_basename": "esp32-default.bin",
       "partition": "default",
       "last_build": {

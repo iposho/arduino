@@ -100,6 +100,8 @@
 - Забыть `publishMqttTelemetry()` в `ensureMqtt()` после connect.
 - Считать, что `led` включён по умолчанию — в коде всегда `false`; «включён» в UI = устаревшая телеметрия.
 - Путать GPIO 33: кнопка на flat (вывеска), гирлянда на flamingo.
+- Ставить `mqttClient.setBufferSize()` меньше размера capabilities: JSON с кириллицей весит 2–3 КБ, при буфере 1024 `publish` молча падает. Во всех скетчах `MQTT_BUFFER_SIZE 4096`.
+- Настраивать task WDT через `esp_task_wdt_init()`: в ядре 3.x TWDT уже запущен (5 с, panic), init вернёт `ESP_ERR_INVALID_STATE`. Нужен `esp_task_wdt_reconfigure()`. Скетч с WDT на loopTask должен кормить его во время OTA: `ota_mqtt::setFeed(...)` + увеличенный таймаут (см. `esp32_default`).
 - Для birdcam использовать partition Huge APP или Default — нужен **min_spiffs**.
 - birdcam: сначала аппаратный JPEG SVGA (XGA на OV3660 не работает — FB-OVF, проверено в 1.3.1); если 5 кадров подряд не пришло (у OV3660 на AI-Thinker — `cam_hal: FB-OVF`), прошивка сама переходит на RGB565 VGA + программный JPEG (`cam_mode` в телеметрии). Детектор работает на кадре 1/8 (≤100×75, `MOTION_MAX_*`, буфер должен вмещать весь кадр / 8).
 - birdcam: `capture` сохраняет текущий кадр на SD; периодической съёмки на SD больше нет — только визиты птиц (не чаще раза в 10 с).
