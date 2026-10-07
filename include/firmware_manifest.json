@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "note": "Коммитится в git. Папка ota/ в .gitignore — бинарники локальны; этот файл хранит последние собранные версии.",
-  "updated_at": "2026-10-07T04:10:10+04:00",
+  "updated_at": "2026-10-07T04:29:08+04:00",
   "devices": {
     "flat": {
       "sketch": "esp32_flat_bme280",
@@ -17,14 +17,14 @@
     },
     "balcony": {
       "sketch": "esp32_balcony_pms5003_bme280",
-      "version": "1.2.0",
+      "version": "1.2.1",
       "ota_basename": "esp32-balcony.bin",
       "partition": "default",
       "last_build": {
-        "date": "20260730",
-        "file": "esp32-balcony-1.2.0-20260730.bin",
-        "bytes": 1187472,
-        "sha256": "e16b25122c4f51186164ed7369e12337e25a9be835d1c3f6194ef19bc0b4b9ed"
+        "date": "20261007",
+        "file": "esp32-balcony-1.2.1-20261007.bin",
+        "bytes": 1193344,
+        "sha256": "ae0cf93fa95e6a97960d57445f6e139d749111bbdfcfbee0f87375984e546d83"
       }
     },
     "birdcam": {

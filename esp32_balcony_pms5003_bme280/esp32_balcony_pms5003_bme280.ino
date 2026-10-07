@@ -59,6 +59,11 @@
 #define PMS_TIMEOUT_MS   2000UL
 #define PMS_MAX_ERRORS      3
 #define WDT_TIMEOUT_SEC    30
+// На время OTA: одно чтение HTTP может ждать секундами, колбэки прогресса редкие
+#define WDT_OTA_TIMEOUT_SEC 120
+// CONNACK ждём не дольше 5 с (по умолчанию 15) — connect() блокирует loop()
+#define MQTT_SOCKET_TIMEOUT_SEC 5
+#define MQTT_RETRY_INTERVAL_MS  5000UL
 #define HTTP_TIMEOUT_MS    8000UL
 
 // NTP (UTC+4)
@@ -396,6 +401,8 @@ const char *CAPABILITIES = R"CAP({
   }
 })CAP";
 unsigned long lastMqttTelemetry = 0;
+unsigned long lastMqttAttempt = 0;
+bool mqttAttempted = false;
 
 char otaUrl[256] = "";
 bool otaPending = false;
@@ -414,6 +421,9 @@ void    initMqttTopics();
 void    handleMqttCommand(char* topic, byte* payload, unsigned int length);
 void    setBoardLed(bool on);
 void    showStatusScreen();
+void    initWatchdog();
+void    setWatchdogTimeout(unsigned long timeoutSec);
+void    feedWatchdog();
 void    ensureMqtt();
 void    publishMqttTelemetry();
 void    publishOtaEvent(const char* phase, int progress = -1);
@@ -690,16 +700,47 @@ void setup() {
   pmsWakeupTargetTime       = now + PMS_READ_INTERVAL - PMS_WAKEUP_TIME - PMS_SAMPLE_TIME;
 
   // Watchdog включаем только после долгого setup (PMS прогрев ~60 сек)
-  esp_task_wdt_config_t wdtConfig = {
-    .timeout_ms     = WDT_TIMEOUT_SEC * 1000UL,
-    .idle_core_mask = 0,
-    .trigger_panic  = true
-  };
-  esp_task_wdt_init(&wdtConfig);
-  esp_task_wdt_add(NULL);
+  initWatchdog();
 
   bootPhase = false;
   Serial.println("[Система] Вход в рабочий цикл.");
+}
+
+// ============================================================
+// Watchdog
+// ============================================================
+// В ядре 3.x TWDT уже запущен до setup() (5 с, panic), поэтому
+// esp_task_wdt_init() вернёт ESP_ERR_INVALID_STATE и настройки не применит.
+// Сначала reconfigure, init — только если TWDT ещё не был инициализирован.
+void setWatchdogTimeout(unsigned long timeoutSec) {
+  esp_task_wdt_config_t cfg = {
+    .timeout_ms     = (uint32_t)(timeoutSec * 1000UL),
+    .idle_core_mask = 0,
+    .trigger_panic  = true
+  };
+  esp_err_t err = esp_task_wdt_reconfigure(&cfg);
+  if (err == ESP_ERR_INVALID_STATE) {
+    err = esp_task_wdt_init(&cfg);
+  }
+  if (err != ESP_OK) {
+    Serial.printf("[WDT] configure %lus failed: %s\n", timeoutSec, esp_err_to_name(err));
+  }
+}
+
+void initWatchdog() {
+  setWatchdogTimeout(WDT_TIMEOUT_SEC);
+  if (esp_task_wdt_status(NULL) != ESP_OK) {
+    esp_err_t err = esp_task_wdt_add(NULL);
+    if (err != ESP_OK) {
+      Serial.printf("[WDT] add loopTask failed: %s\n", esp_err_to_name(err));
+      return;
+    }
+  }
+  Serial.printf("[WDT] %us, panic on timeout\n", (unsigned)WDT_TIMEOUT_SEC);
+}
+
+void feedWatchdog() {
+  esp_task_wdt_reset();
 }
 
 // ============================================================
@@ -1244,6 +1285,7 @@ void initMqttTopics() {
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
   mqttClient.setCallback(handleMqttCommand);
   mqttClient.setBufferSize(MQTT_BUFFER_SIZE);
+  mqttClient.setSocketTimeout(MQTT_SOCKET_TIMEOUT_SEC);
   mqttTopicsReady = true;
 }
 
@@ -1549,6 +1591,12 @@ void ensureMqtt() {
 
   if (mqttClient.connected()) return;
 
+  // Без паузы при недоступном брокере connect() блокировал бы каждый проход loop()
+  unsigned long now = millis();
+  if (mqttAttempted && now - lastMqttAttempt < MQTT_RETRY_INTERVAL_MS) return;
+  mqttAttempted = true;
+  lastMqttAttempt = now;
+
   esp_task_wdt_reset();
   if (mqttClient.connect(DEVICE_HOSTNAME, MQTT_USER, MQTT_PASS,
                          topicStatus, 1, true, "{\"status\":\"offline\"}")) {
@@ -1645,6 +1693,11 @@ void performOtaUpdate(const char* url) {
   showOtaScreen("Downloading...", url);
 
   ota_mqtt::bind(mqttClient, topicTelemetry, ensureMqtt, lastOtaProgress);
+  // httpUpdate.update() держит loop() всю загрузку: кормим WDT из колбэков
+  // прогресса и расширяем таймаут на время скачивания.
+  ota_mqtt::setFeed(feedWatchdog);
+  setWatchdogTimeout(WDT_OTA_TIMEOUT_SEC);
+  feedWatchdog();
   publishOtaEvent("starting", 0);
   lastOtaProgress = 0;
 
@@ -1708,6 +1761,9 @@ void performOtaUpdate(const char* url) {
     delay(3000);
     updateOled(oledPage);
   }
+  ota_mqtt::setFeed(nullptr);
+  setWatchdogTimeout(WDT_TIMEOUT_SEC);
+  feedWatchdog();
 }
 
 // ============================================================
