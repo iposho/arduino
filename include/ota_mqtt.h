@@ -8,6 +8,8 @@
 // Публикация OTA-прогресса в devices/<id>/telemetry.
 // Формат: {"ota":"downloading","progress":40}
 // ensure() переподключает MQTT, если сокет был закрыт перед HTTPS-загрузкой.
+// setFeed() — необязательно: скетч с task WDT передаёт функцию сброса,
+// иначе httpUpdate.update() блокирует loop() на всю загрузку и WDT срабатывает.
 
 namespace ota_mqtt {
 
@@ -17,6 +19,7 @@ struct Bindings {
   bool (*ensure)() = nullptr;
   void (*ensureVoid)() = nullptr;
   int* lastProgress = nullptr;
+  void (*feed)() = nullptr;
 };
 
 inline Bindings& bindings() {
@@ -44,8 +47,18 @@ inline void bind(PubSubClient& client, const char* topic,
   b.lastProgress = &lastProgress;
 }
 
+inline void setFeed(void (*feed)()) {
+  bindings().feed = feed;
+}
+
+inline void feedWatchdog() {
+  auto& b = bindings();
+  if (b.feed) b.feed();
+}
+
 inline void reconnectIfNeeded() {
   auto& b = bindings();
+  feedWatchdog();
   if (b.client && b.client->connected()) return;
   if (b.ensure) {
     b.ensure();
@@ -78,12 +91,14 @@ inline void publish(const char* phase, int progress) {
 }
 
 inline void onStart() {
+  feedWatchdog();
   auto& b = bindings();
   if (b.lastProgress) *b.lastProgress = 0;
   publish("downloading", 0);
 }
 
 inline void onProgress(size_t current, size_t total) {
+  feedWatchdog();
   auto& b = bindings();
   int pct = (total > 0) ? (int)((current * 100UL) / total) : 0;
   if (!b.lastProgress || pct >= *b.lastProgress + 1 || pct == 100 || *b.lastProgress < 0) {
@@ -93,6 +108,7 @@ inline void onProgress(size_t current, size_t total) {
 }
 
 inline void onEnd() {
+  feedWatchdog();
   auto& b = bindings();
   if (b.lastProgress) *b.lastProgress = 100;
   publish("rebooting", 100);

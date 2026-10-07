@@ -56,7 +56,7 @@ flowchart LR
 
 - Wi-Fi + MQTT сразу после прошивки
 - Телеметрия каждые 10 с (IP, RSSI, uptime, heap, версия)
-- Watchdog 30 с, автопереподключение Wi-Fi
+- Watchdog 30 с (на время OTA — 120 с), автопереподключение Wi-Fi и MQTT (раз в 5 с)
 - OTA — можно сразу обновить на целевую прошивку (flat, flamingo, …)
 
 **MQTT-команды:**
@@ -68,8 +68,10 @@ flowchart LR
 | `reboot` | Перезагрузка |
 | `ota` + `url: string` | OTA-обновление по HTTP(S) |
 | `pin_mode` + `pin`, `mode` | `OUTPUT` / `INPUT` / `INPUT_PULLUP` |
-| `pin_write` + `pin`, `value` | Цифровой 0/1 или PWM 0–255 |
-| `pin_read` + `pin` | Чтение пина → ответ в telemetry |
+| `pin_write` + `pin`, `value` | `0`/`1` — цифровой, `2`–`255` — PWM |
+| `pin_read` + `pin` | Чтение пина → ответ в telemetry (`pin_N_analog` только для GPIO 32–39) |
+
+Доступные GPIO для `pin_*`: 0, 2, 4, 5, 12–15, 18, 19, 21–23, 25–27, 32–39 (34–39 — только вход); 16/17 — если нет PSRAM. GPIO 1/3 (UART0) и 6–11 (flash) закрыты. GPIO 2 (LED) — только через `led` или `pin_write` 0/1.
 
 **Быстрый старт:**
 
