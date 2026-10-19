@@ -71,6 +71,12 @@
 // Внутренний pull-up: отпущена = HIGH, нажата = LOW.
 #define FLAMINGO_BTN_PIN  33
 
+// Динамик (с резистором): (+) → GPIO 25, (−) → GND.
+#define SPEAKER_PIN       25
+#define SOUND_SETTINGS_FILE "/sound_alert.dat"
+#define NIGHT_START_HOUR  23
+#define NIGHT_END_HOUR    8
+
 // Подробные логи кнопки в Serial Monitor (115200). Выключите после отладки.
 #define FLAMINGO_BTN_DEBUG  1
 #define FLAMINGO_BTN_LOG_MS 2000UL
@@ -228,6 +234,8 @@ bool indoorAlertEpisode = false;
 bool aqiAlertEpisode = false;
 
 bool boardLedOn = false;
+bool soundAlertEnabled = true;
+uint8_t soundVolume = 100; // 10..100%
 
 // =====================
 // Button state
@@ -293,6 +301,31 @@ bool mqttTopicsReady = false;
 const char *CAPABILITIES = R"CAP({
   "commands": [
     {
+      "action": "sound_alert",
+      "title": "Звук при CO₂",
+      "type": "toggle",
+      "icon": "volume-2",
+      "description": "Звуковой сигнал (GPIO 25) при превышении CO₂/TVOC в квартире (кроме 23:00–08:00)"
+    },
+    {
+      "action": "sound_volume",
+      "title": "Громкость звука",
+      "type": "range",
+      "icon": "volume-2",
+      "min": 10,
+      "max": 100,
+      "step": 10,
+      "unit": "%",
+      "description": "Громкость динамика на GPIO 25 (10–100%)"
+    },
+    {
+      "action": "sound_test",
+      "title": "Тест звука",
+      "type": "trigger",
+      "icon": "music",
+      "description": "Проиграть мелодию уведомления на динамике (GPIO 25)"
+    },
+    {
       "action": "led",
       "title": "Светодиод",
       "type": "toggle",
@@ -337,6 +370,8 @@ const char *CAPABILITIES = R"CAP({
     { "key": "out_pressure", "label": "Давление (балкон)", "icon": "gauge", "format": "number", "unit": "мм рт.ст.", "group": "Улица", "order": 22 },
     { "key": "out_pm25", "label": "PM2.5 (балкон)", "icon": "activity", "format": "number", "unit": "µg/m³", "group": "Улица", "order": 23 },
     { "key": "out_pm10", "label": "PM10 (балкон)", "icon": "activity", "format": "number", "unit": "µg/m³", "group": "Улица", "order": 24 },
+    { "key": "sound_alert", "label": "Звук при CO₂", "icon": "volume-2", "format": "boolean", "group": "Устройство", "order": 28 },
+    { "key": "sound_volume", "label": "Громкость звука", "icon": "volume-2", "format": "percent", "group": "Устройство", "order": 29 },
     { "key": "led", "label": "Светодиод", "icon": "lightbulb", "format": "boolean", "group": "Устройство", "order": 30 },
     { "key": "fw_version", "label": "Версия прошивки", "icon": "cpu", "group": "Система", "order": 40 }
   ],
@@ -367,6 +402,14 @@ void updateEns160IfNeeded();
 void feedEns160EnvData();
 void dismissScreenAlerts();
 void checkScreenAlerts();
+void loadSoundAlertSetting();
+void saveSoundAlertSetting();
+void setSoundAlertEnabled(bool enabled);
+void setSoundVolume(uint8_t vol);
+void playNotePwm(uint16_t freqHz, uint16_t durationMs);
+bool isNightHours();
+void playAirQualityChime();
+void maybePlayAirQualityAlert();
 void drawCurrentScreen();
 void drawBirdScreen();
 void fetchBirdPhoto(bool force);
@@ -567,6 +610,101 @@ void setBoardLed(bool on) {
   digitalWrite(LED_BUILTIN, on ? LOW : HIGH);
 }
 
+void loadSoundAlertSetting() {
+  if (!littleFsReady || !LittleFS.exists(SOUND_SETTINGS_FILE)) return;
+  File f = LittleFS.open(SOUND_SETTINGS_FILE, "r");
+  if (!f) return;
+  String line = f.readStringUntil('\n');
+  f.close();
+  line.trim();
+  if (line.length() == 0) return;
+
+  soundAlertEnabled = (line[0] != '0');
+  int comma = line.indexOf(',');
+  if (comma > 0) {
+    int vol = line.substring(comma + 1).toInt();
+    if (vol >= 10 && vol <= 100) {
+      soundVolume = (uint8_t)vol;
+    }
+  }
+  Serial.printf("[Sound] loaded soundAlertEnabled=%s volume=%u%%\n",
+                soundAlertEnabled ? "true" : "false", soundVolume);
+}
+
+void saveSoundAlertSetting() {
+  if (!littleFsReady) return;
+  File f = LittleFS.open(SOUND_SETTINGS_FILE, "w");
+  if (!f) return;
+  f.printf("%d,%u", soundAlertEnabled ? 1 : 0, soundVolume);
+  f.close();
+}
+
+void setSoundAlertEnabled(bool enabled) {
+  soundAlertEnabled = enabled;
+  saveSoundAlertSetting();
+}
+
+void setSoundVolume(uint8_t vol) {
+  soundVolume = (uint8_t)constrain((int)vol, 10, 100);
+  saveSoundAlertSetting();
+}
+
+bool isNightHours() {
+  time_t now = time(nullptr);
+  if (now < 100000) {
+    // Если время не синхронизировано по NTP — на всякий случай не пищим
+    return true;
+  }
+  struct tm t;
+  localtime_r(&now, &t);
+  return (t.tm_hour >= NIGHT_START_HOUR || t.tm_hour < NIGHT_END_HOUR);
+}
+
+void playNotePwm(uint16_t freqHz, uint16_t durationMs) {
+  if (freqHz == 0 || soundVolume == 0) {
+    delay(durationMs);
+    return;
+  }
+  // Для динамика максимальная громкость — на скважности 50% (duty 128 из 255).
+  // При 100% громкости duty = 128, при меньшей — пропорционально уже импульс.
+  uint32_t duty = ((uint32_t)soundVolume * 128U) / 100U;
+  if (duty < 2) duty = 2;
+
+  ledcAttach(SPEAKER_PIN, freqHz, 8);
+  ledcWrite(SPEAKER_PIN, duty);
+  delay(durationMs);
+  ledcWrite(SPEAKER_PIN, 0);
+  ledcDetach(SPEAKER_PIN);
+  pinMode(SPEAKER_PIN, OUTPUT);
+  digitalWrite(SPEAKER_PIN, LOW);
+}
+
+void playAirQualityChime() {
+  // Более звонкое 3-нотное уведомление в 6-й октаве (резонанс мини-динамиков):
+  // C6 (1047 Гц) -> E6 (1319 Гц) -> G6 (1568 Гц), плюс повтор финальной ноты
+  const uint16_t notes[]     = { 1047, 1319, 1568, 2093 };
+  const uint16_t durations[] = {  150,  150,  180,  280 };
+  const uint16_t gaps[]      = {   35,   35,   40,    0 };
+
+  for (size_t i = 0; i < 4; i++) {
+    playNotePwm(notes[i], durations[i]);
+    if (gaps[i] > 0) delay(gaps[i]);
+  }
+}
+
+void maybePlayAirQualityAlert() {
+  if (!soundAlertEnabled) {
+    Serial.println("[Sound] skipped (sound_alert disabled)");
+    return;
+  }
+  if (isNightHours()) {
+    Serial.println("[Sound] skipped (night hours or time unsynced)");
+    return;
+  }
+  Serial.printf("[Sound] playing air quality chime (vol=%u%%)\n", soundVolume);
+  playAirQualityChime();
+}
+
 void showStatusScreen() {
   showingInfoScreen = true;
   showingTimeScreen = false;
@@ -581,7 +719,7 @@ bool isGpioPinAllowed(uint8_t pin) {
       pin == TFT_SCLK || pin == TFT_MOSI ||
       pin == BME_SDA_PIN || pin == BME_SCL_PIN ||
       pin == JOY_X_PIN || pin == JOY_Y_PIN || pin == JOY_SW_PIN ||
-      pin == FLAMINGO_BTN_PIN) {
+      pin == FLAMINGO_BTN_PIN || pin == SPEAKER_PIN) {
     return false;
   }
   return true;
@@ -836,6 +974,35 @@ void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
   }
   Serial.printf("[MQTT] action=%s\n", action);
 
+  if (strcmp(action, "sound_alert") == 0) {
+    if (doc["value"].is<bool>()) {
+      setSoundAlertEnabled(doc["value"]);
+    } else if (doc["value"].is<int>()) {
+      setSoundAlertEnabled(doc["value"] != 0);
+    } else {
+      return;
+    }
+    Serial.printf("[MQTT] sound_alert %s\n", soundAlertEnabled ? "on" : "off");
+    publishMqttTelemetry();
+    return;
+  }
+
+  if (strcmp(action, "sound_volume") == 0) {
+    if (!doc["value"].is<int>() && !doc["value"].is<float>()) return;
+    int vol = (int)round(doc["value"].as<float>());
+    setSoundVolume((uint8_t)constrain(vol, 10, 100));
+    Serial.printf("[MQTT] sound_volume %u%%\n", soundVolume);
+    publishMqttTelemetry();
+    return;
+  }
+
+  if (strcmp(action, "sound_test") == 0) {
+    Serial.printf("[MQTT] sound_test (vol=%u%%)\n", soundVolume);
+    playAirQualityChime();
+    publishMqttTelemetry();
+    return;
+  }
+
   if (strcmp(action, "led") == 0) {
     if (doc["value"].is<bool>()) {
       setBoardLed(doc["value"]);
@@ -1001,6 +1168,8 @@ void publishMqttTelemetry() {
   doc["bme_ready"] = bmeReady;
   doc["aht_ready"] = ahtReady;
   doc["ens160_ready"] = ens160Ready;
+  doc["sound_alert"] = soundAlertEnabled;
+  doc["sound_volume"] = soundVolume;
   doc["led"] = boardLedOn;
   doc["screen"] = (int)currentScreen + 1;
   doc["overlay"] = showingTimeScreen ? "time" : (showingInfoScreen ? "status" : "");
@@ -1502,6 +1671,7 @@ void checkScreenAlerts() {
     alertLock = true;
     setStatus(eco2High ? "CO2 high!" : "TVOC high!");
     Serial.printf("[Alert] -> indoor screen (eCO2=%d tvoc=%d)\n", eco2, tvoc);
+    maybePlayAirQualityAlert();
     return;
   }
 
@@ -2292,6 +2462,9 @@ void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   setBoardLed(false);
 
+  pinMode(SPEAKER_PIN, OUTPUT);
+  digitalWrite(SPEAKER_PIN, LOW);
+
   Serial.begin(115200);
   delay(1000);
 
@@ -2331,6 +2504,7 @@ void setup() {
   } else {
     Serial.printf("[LittleFS] mounted, used=%u total=%u\n",
                   LittleFS.usedBytes(), LittleFS.totalBytes());
+    loadSoundAlertSetting();
   }
 
   showMessage("START", "TFT OK", "Starting BME280");

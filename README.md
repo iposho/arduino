@@ -168,6 +168,7 @@ ESP32 DevKit + BME280 + 1.8" TFT ST7735 + джойстик.
 - Загрузка уличных данных из Supabase каждые 10 минут
 - **MQTT** — телеметрия на шлюз
 - Кнопка GPIO 33 — переключение вывески esp32-flamingo (relay MQTT)
+- Динамик с резистором на GPIO 25 — звуковой сигнал (3 ноты) при превышении CO₂ (>1000 ppm) или TVOC (>500 ppb) в квартире, кроме ночного времени (23:00–08:00). Настройка сохраняется в LittleFS (`/sound_alert.dat`)
 
 **Удалённый мониторинг:** MQTT. Локального HTTP-интерфейса нет.
 
@@ -175,6 +176,9 @@ ESP32 DevKit + BME280 + 1.8" TFT ST7735 + джойстик.
 
 | action | Описание |
 |--------|----------|
+| `sound_alert` + `value: bool` | Вкл/выкл звуковой сигнал при превышении CO₂/TVOC; телеметрия сразу |
+| `sound_volume` + `value: 10–100` | Громкость динамика в % (PWM скважность); телеметрия сразу |
+| `sound_test` | Проиграть тестовую мелодию на динамике (GPIO 25) |
 | `led` + `value: bool` | Встроенный LED платы (GPIO 2); телеметрия сразу |
 | `reboot` | Перезагрузка |
 | `status` | Показать экран System info |
@@ -196,6 +200,7 @@ ESP32 DevKit + BME280 + 1.8" TFT ST7735 + джойстик.
 | Joystick Y | 35 |
 | Joystick SW | 32 |
 | Кнопка flamingo | 33 |
+| Динамик (+ с резистором) | 25 |
 
 **Плата:** ESP32 Dev Module, Partition = **Default** (4MB with spiffs, OTA).
 
@@ -371,7 +376,7 @@ ESP32 DevKit + неоновая вывеска на GPIO 13 (PWM) + гирлян
 
 | Цель | Плата | Partition | Версия* | Пример файла |
 |------|-------|-----------|---------|--------------|
-| `flat` | ESP32 Dev Module | Default | 1.3.2 | `ota/esp32-flat-1.3.2-20261007.bin` |
+| `flat` | ESP32 Dev Module | Default | 1.3.4 | `ota/esp32-flat-1.3.4-20261020.bin` |
 | `balcony` | ESP32 Dev Module | Default | 1.2.1 | `ota/esp32-balcony-1.2.1-20261007.bin` |
 | `birdcam` | AI Thinker ESP32-CAM | min_spiffs | 1.4.2 | `ota/esp32-bird-cam-1.4.2-20261006.bin` |
 | `flamingo` | ESP32 Dev Module | Default | 1.0.12 | `ota/esp32-flamingo-1.0.12-20260918.bin` |

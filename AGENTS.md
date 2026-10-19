@@ -18,7 +18,7 @@
 | id | hostname | sketch | partition | Назначение |
 |----|----------|--------|-----------|------------|
 | default | `esp32-default` | `esp32_default` | default | Универсальная заготовка для новой платы |
-| flat | `esp32-flat` | `esp32_flat_bme280` | default | Комнатный TFT + BME280/AHT/ENS160 |
+| flat | `esp32-flat` | `esp32_flat_bme280` | default | Комнатный TFT + BME280/AHT/ENS160 + динамик GPIO 25 |
 | balcony | `esp32-balcony` | `esp32_balcony_pms5003_bme280` | default | Балкон: BME280 + PMS5003 + OLED |
 | birdcam | `esp32-bird-cam` | `esp32_bird_cam` | **min_spiffs** | ESP32-CAM у кормушки: кадр 1 fps в RAM (`/latest.jpg`), детектор движения, снимки визитов на SD (`/photo?id=`, `/birds.json`) |
 | flamingo | `esp32-flamingo` | `esp32_flamingo` | default | Вывеска PWM GPIO 13 + гирлянда GPIO 33 + стробоскоп GPIO 25 + кнопка GPIO 27 |
@@ -76,12 +76,13 @@
 3. После релизной сборки: `./scripts/build-ota.sh <id>` → закоммить обновлённый `firmware_manifest.json` (`last_build` пишет скрипт).
 4. `ota/` в `.gitignore` — бинарники локальные.
 
-## flat: экран кормушки
+## flat: экран кормушки и звуковые оповещения
 
 - `SCREEN_BIRD` рисует последнюю подтверждённую птицу: `GET <GATEWAY_URL>/api/camera/birdfeeder/tft` (репозиторий шлюза, `lib/bird-tft.ts`) с `Authorization: Bearer <CAMERA_API_TOKEN>` — оба в `secrets.h`; `GATEWAY_URL` по умолчанию `http://<MQTT_HOST>:3000`.
 - Ответ — сырой RGB565 little-endian 160×120, плата льёт его построчно в дисплей (JPEG на плате не декодируется). Тело приходит чанками без `Content-Length` — читать через `http.writeToStream()`, а не `getSize()` + `getStreamPtr()` (в 1.3.0 экран показывал «Gateway: 200»). Подпись — из заголовков `X-Species` (латынь: в шрифте нет кириллицы) и `X-Shot-At`.
 - Картинка в памяти не хранится: при каждом входе на экран качается заново, дальше раз в 30 с запрос с `If-None-Match` (304, пока птица та же).
 - На этом экране `setStatus()` не рисует строку статуса — она легла бы поверх снимка.
+- **Динамик (GPIO 25):** проигрывает мелодию (LEDC PWM в 6-й октаве) при превышении `eCO2 > 1000 ppm` или `TVOC > 500 ppb` (1 раз за эпизод, кроме ночных часов `23:00–08:00`). Команды: `sound_alert` (bool), `sound_volume` (10–100%), `sound_test` (trigger). Настройки хранятся в LittleFS `/sound_alert.dat` (`<enabled>,<volume>`).
 
 ## Flamingo ↔ Flat
 
