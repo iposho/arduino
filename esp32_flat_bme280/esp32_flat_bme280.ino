@@ -1070,8 +1070,12 @@ void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
   }
 
   if (strcmp(action, "sound_test") == 0) {
-    Serial.printf("[MQTT] sound_test (vol=%u%%)\n", soundVolume);
-    playAirQualityChime();
+    uint8_t sigToPlay = soundSignal;
+    if (doc["value"].is<int>() || doc["value"].is<float>()) {
+      sigToPlay = (uint8_t)constrain((int)round(doc["value"].as<float>()), 0, 3);
+    }
+    Serial.printf("[MQTT] sound_test (sig=%u, vol=%u%%)\n", sigToPlay, soundVolume);
+    playAirQualitySignal(sigToPlay);
     publishMqttTelemetry();
     return;
   }
