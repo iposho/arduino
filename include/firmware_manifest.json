@@ -1,18 +1,18 @@
 {
   "schema": 1,
   "note": "Коммитится в git. Папка ota/ в .gitignore — бинарники локальны; этот файл хранит последние собранные версии.",
-  "updated_at": "2026-10-20T02:43:56+04:00",
+  "updated_at": "2026-10-20T06:57:37+04:00",
   "devices": {
     "flat": {
       "sketch": "esp32_flat_bme280",
-      "version": "1.3.4",
+      "version": "1.3.5",
       "ota_basename": "esp32-flat.bin",
       "partition": "default",
       "last_build": {
         "date": "20261020",
-        "file": "esp32-flat-1.3.4-20261020.bin",
-        "bytes": 1206032,
-        "sha256": "3562d6fa77c320ef6def8dd34449ace46e0be71bae569dc14a6e0aa05ed56b1e"
+        "file": "esp32-flat-1.3.5-20261020.bin",
+        "bytes": 1207440,
+        "sha256": "bb62d45318e262609e709bb21d9022c832167b1a183f6e5f3fc673a4a7ceb561"
       }
     },
     "balcony": {

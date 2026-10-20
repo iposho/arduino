@@ -236,6 +236,7 @@ bool aqiAlertEpisode = false;
 bool boardLedOn = false;
 bool soundAlertEnabled = true;
 uint8_t soundVolume = 100; // 10..100%
+uint8_t soundSignal = 0;   // 0: Перезвон, 1: Двойной бип, 2: Восходящий, 3: Пульс
 
 // =====================
 // Button state
@@ -308,6 +309,19 @@ const char *CAPABILITIES = R"CAP({
       "description": "Звуковой сигнал (GPIO 25) при превышении CO₂/TVOC в квартире (кроме 23:00–08:00)"
     },
     {
+      "action": "sound_signal",
+      "title": "Мелодия сигнала",
+      "type": "select",
+      "icon": "music",
+      "options": [
+        { "value": 0, "label": "Перезвон" },
+        { "value": 1, "label": "Двойной бип" },
+        { "value": 2, "label": "Восходящий" },
+        { "value": 3, "label": "Пульс" }
+      ],
+      "description": "Выбор звукового сигнала уведомления"
+    },
+    {
       "action": "sound_volume",
       "title": "Громкость звука",
       "type": "range",
@@ -371,8 +385,9 @@ const char *CAPABILITIES = R"CAP({
     { "key": "out_pm25", "label": "PM2.5 (балкон)", "icon": "activity", "format": "number", "unit": "µg/m³", "group": "Улица", "order": 23 },
     { "key": "out_pm10", "label": "PM10 (балкон)", "icon": "activity", "format": "number", "unit": "µg/m³", "group": "Улица", "order": 24 },
     { "key": "sound_alert", "label": "Звук при CO₂", "icon": "volume-2", "format": "boolean", "group": "Устройство", "order": 28 },
-    { "key": "sound_volume", "label": "Громкость звука", "icon": "volume-2", "format": "percent", "group": "Устройство", "order": 29 },
-    { "key": "led", "label": "Светодиод", "icon": "lightbulb", "format": "boolean", "group": "Устройство", "order": 30 },
+    { "key": "sound_signal", "label": "Мелодия сигнала", "icon": "music", "format": "number", "group": "Устройство", "order": 29 },
+    { "key": "sound_volume", "label": "Громкость звука", "icon": "volume-2", "format": "percent", "group": "Устройство", "order": 30 },
+    { "key": "led", "label": "Светодиод", "icon": "lightbulb", "format": "boolean", "group": "Устройство", "order": 31 },
     { "key": "fw_version", "label": "Версия прошивки", "icon": "cpu", "group": "Система", "order": 40 }
   ],
   "dashboard": {
@@ -620,22 +635,34 @@ void loadSoundAlertSetting() {
   if (line.length() == 0) return;
 
   soundAlertEnabled = (line[0] != '0');
-  int comma = line.indexOf(',');
-  if (comma > 0) {
-    int vol = line.substring(comma + 1).toInt();
-    if (vol >= 10 && vol <= 100) {
-      soundVolume = (uint8_t)vol;
+  int comma1 = line.indexOf(',');
+  if (comma1 > 0) {
+    int comma2 = line.indexOf(',', comma1 + 1);
+    if (comma2 > 0) {
+      int vol = line.substring(comma1 + 1, comma2).toInt();
+      if (vol >= 10 && vol <= 100) {
+        soundVolume = (uint8_t)vol;
+      }
+      int sig = line.substring(comma2 + 1).toInt();
+      if (sig >= 0 && sig <= 3) {
+        soundSignal = (uint8_t)sig;
+      }
+    } else {
+      int vol = line.substring(comma1 + 1).toInt();
+      if (vol >= 10 && vol <= 100) {
+        soundVolume = (uint8_t)vol;
+      }
     }
   }
-  Serial.printf("[Sound] loaded soundAlertEnabled=%s volume=%u%%\n",
-                soundAlertEnabled ? "true" : "false", soundVolume);
+  Serial.printf("[Sound] loaded soundAlertEnabled=%s volume=%u%% signal=%u\n",
+                soundAlertEnabled ? "true" : "false", soundVolume, soundSignal);
 }
 
 void saveSoundAlertSetting() {
   if (!littleFsReady) return;
   File f = LittleFS.open(SOUND_SETTINGS_FILE, "w");
   if (!f) return;
-  f.printf("%d,%u", soundAlertEnabled ? 1 : 0, soundVolume);
+  f.printf("%d,%u,%u", soundAlertEnabled ? 1 : 0, soundVolume, soundSignal);
   f.close();
 }
 
@@ -646,6 +673,11 @@ void setSoundAlertEnabled(bool enabled) {
 
 void setSoundVolume(uint8_t vol) {
   soundVolume = (uint8_t)constrain((int)vol, 10, 100);
+  saveSoundAlertSetting();
+}
+
+void setSoundSignal(uint8_t sig) {
+  soundSignal = (uint8_t)constrain((int)sig, 0, 3);
   saveSoundAlertSetting();
 }
 
@@ -679,17 +711,49 @@ void playNotePwm(uint16_t freqHz, uint16_t durationMs) {
   digitalWrite(SPEAKER_PIN, LOW);
 }
 
-void playAirQualityChime() {
-  // Более звонкое 3-нотное уведомление в 6-й октаве (резонанс мини-динамиков):
-  // C6 (1047 Гц) -> E6 (1319 Гц) -> G6 (1568 Гц), плюс повтор финальной ноты
-  const uint16_t notes[]     = { 1047, 1319, 1568, 2093 };
-  const uint16_t durations[] = {  150,  150,  180,  280 };
-  const uint16_t gaps[]      = {   35,   35,   40,    0 };
-
-  for (size_t i = 0; i < 4; i++) {
-    playNotePwm(notes[i], durations[i]);
-    if (gaps[i] > 0) delay(gaps[i]);
+void playAirQualitySignal(uint8_t signalId) {
+  switch (signalId) {
+    case 1: {
+      // 1: Двойной бип (2 коротких звонких импульса A6 1760 Гц)
+      playNotePwm(1760, 100);
+      delay(80);
+      playNotePwm(1760, 140);
+      break;
+    }
+    case 2: {
+      // 2: Восходящий (быстрая лесенка из 5 нот: G5->C6->E6->G6->C7)
+      const uint16_t notes[] = { 784, 1047, 1319, 1568, 2093 };
+      for (size_t i = 0; i < 5; i++) {
+        playNotePwm(notes[i], 80);
+        delay(25);
+      }
+      break;
+    }
+    case 3: {
+      // 3: Пульс (3 пульсирующих акцента E6 1319 Гц)
+      for (size_t i = 0; i < 3; i++) {
+        playNotePwm(1319, 120);
+        if (i < 2) delay(90);
+      }
+      break;
+    }
+    case 0:
+    default: {
+      // 0: Перезвон (звонкий мажорный перезвон: C6 -> E6 -> G6 -> C7)
+      const uint16_t notes[]     = { 1047, 1319, 1568, 2093 };
+      const uint16_t durations[] = {  150,  150,  180,  280 };
+      const uint16_t gaps[]      = {   35,   35,   40,    0 };
+      for (size_t i = 0; i < 4; i++) {
+        playNotePwm(notes[i], durations[i]);
+        if (gaps[i] > 0) delay(gaps[i]);
+      }
+      break;
+    }
   }
+}
+
+void playAirQualityChime() {
+  playAirQualitySignal(soundSignal);
 }
 
 void maybePlayAirQualityAlert() {
@@ -701,8 +765,8 @@ void maybePlayAirQualityAlert() {
     Serial.println("[Sound] skipped (night hours or time unsynced)");
     return;
   }
-  Serial.printf("[Sound] playing air quality chime (vol=%u%%)\n", soundVolume);
-  playAirQualityChime();
+  Serial.printf("[Sound] playing air quality alert (sig=%u, vol=%u%%)\n", soundSignal, soundVolume);
+  playAirQualitySignal(soundSignal);
 }
 
 void showStatusScreen() {
@@ -987,6 +1051,15 @@ void handleMqttCommand(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
+  if (strcmp(action, "sound_signal") == 0) {
+    if (!doc["value"].is<int>() && !doc["value"].is<float>()) return;
+    int sig = (int)round(doc["value"].as<float>());
+    setSoundSignal((uint8_t)sig);
+    Serial.printf("[MQTT] sound_signal %u\n", soundSignal);
+    publishMqttTelemetry();
+    return;
+  }
+
   if (strcmp(action, "sound_volume") == 0) {
     if (!doc["value"].is<int>() && !doc["value"].is<float>()) return;
     int vol = (int)round(doc["value"].as<float>());
@@ -1169,6 +1242,7 @@ void publishMqttTelemetry() {
   doc["aht_ready"] = ahtReady;
   doc["ens160_ready"] = ens160Ready;
   doc["sound_alert"] = soundAlertEnabled;
+  doc["sound_signal"] = soundSignal;
   doc["sound_volume"] = soundVolume;
   doc["led"] = boardLedOn;
   doc["screen"] = (int)currentScreen + 1;
